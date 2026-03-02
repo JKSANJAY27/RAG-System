@@ -30,6 +30,15 @@ class Settings:
     chunk_size: int
     chunk_overlap: int
 
+    # ── Phase 2: Hybrid Retrieval ────────────────────────────────────────────
+    # Weight for semantic search in RRF fusion (0=BM25 only, 1=vector only)
+    hybrid_alpha: float
+
+    # ── Phase 2: Re-Ranking ──────────────────────────────────────────────────
+    reranker_model: str            # cross-encoder model name
+    reranker_top_k: int            # keep only this many chunks after re-ranking
+    citation_score_threshold: float  # min sigmoid score; below = decline to answer
+
 
 def load_settings() -> Settings:
     """Read environment variables and return a validated Settings object."""
@@ -41,6 +50,11 @@ def load_settings() -> Settings:
         top_k=int(os.getenv("TOP_K", "5")),
         chunk_size=int(os.getenv("CHUNK_SIZE", "800")),
         chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "100")),
+        # Phase 2
+        hybrid_alpha=float(os.getenv("HYBRID_ALPHA", "0.5")),
+        reranker_model=os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
+        reranker_top_k=int(os.getenv("RERANKER_TOP_K", "3")),
+        citation_score_threshold=float(os.getenv("CITATION_SCORE_THRESHOLD", "0.1")),
     )
 
 

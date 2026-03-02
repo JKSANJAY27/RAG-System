@@ -186,7 +186,41 @@ class VectorStore:
         """Return the number of chunks currently in the store."""
         return self._collection.count()
 
+    def get_all_chunks(self) -> List[RetrievedChunk]:
+        """
+        Retrieve ALL chunks from the collection.
+
+        WHY THIS EXISTS (Phase 2):
+            BM25 is a keyword-search algorithm that needs the entire corpus
+            in memory to build its index. We call this once at startup to
+            load all stored chunks and build the BM25 index from them.
+            This approach is standard for moderate corpus sizes (<100K chunks).
+
+        Returns:
+            List of all RetrievedChunk objects in the collection.
+        """
+        if self._collection.count() == 0:
+            return []
+
+        results = self._collection.get(
+            include=["documents", "metadatas"]
+        )
+
+        all_chunks = []
+        for doc, meta in zip(results["documents"], results["metadatas"]):
+            all_chunks.append(
+                RetrievedChunk(
+                    text=doc,
+                    source=meta.get("source", "unknown"),
+                    chunk_index=meta.get("chunk_index", 0),
+                    score=0.0,  # No score yet — BM25 will compute it
+                    metadata=meta,
+                )
+            )
+        return all_chunks
+
     def delete_collection(self) -> None:
         """Delete all data (useful for testing or starting fresh)."""
         self._client.delete_collection(self._collection.name)
         print("  ⚠ Collection deleted.")
+

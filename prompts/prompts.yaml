@@ -13,10 +13,10 @@
 #   {variable_name} placeholders are filled in at runtime by the generator.
 # =============================================================================
 
-version: "1.0.0"
+version: "1.1.0"
 
-# ─── RAG Answer Generation Prompt ─────────────────────────────────────────────
-# This is the main prompt used when generating answers from retrieved context.
+# ─── RAG Answer Generation Prompt (v1.1.0) ────────────────────────────────────
+# Upgraded from v1.0.0: added relevance instruction aware of re-ranking scores.
 rag_answer:
   description: "Used to generate a cited answer from retrieved document chunks."
   template: |
@@ -31,6 +31,8 @@ rag_answer:
        question, respond with:
        "I cannot find a reliable answer in the provided documents."
     4. Never fabricate information.
+    5. The context chunks are ordered by relevance (most relevant first).
+       Prefer information from higher-ranked chunks.
 
     ─── CONTEXT ───────────────────────────────────────────────────────────────
     {context}
@@ -41,7 +43,7 @@ rag_answer:
     ANSWER:
 
 # ─── No-Context Fallback Prompt ───────────────────────────────────────────────
-# Used when retrieval returns zero chunks (e.g., empty vector store).
+# Used when retrieval returns zero chunks (empty store OR citation enforcement).
 no_context_fallback:
   description: "Used when no relevant chunks are retrieved."
   template: |
