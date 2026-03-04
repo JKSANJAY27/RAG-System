@@ -1,24 +1,25 @@
 """
-src/rag_pipeline.py — Top-Level RAG Orchestrator
+src/rag_pipeline.py — Top-Level RAG Orchestrator (Phase 4: Full Tracing)
 
-WHAT IS THIS FILE?
-    This is the "conductor" of your RAG orchestra. It wires together all
-    the individual modules:
-        Ingestor → Chunker → Embedder → VectorStore
-                              ↑                        (ingest path)
-        Retriever ← Embedder ← VectorStore
-            ↓
-        Generator → GeneratedAnswer                    (query path)
+WHAT CHANGED FROM PHASE 3?
+    Phase 3: Simple timer logging around retrieval + generation blocks.
+    Phase 4: Creates a TraceContext at start of each query, passes it down
+             through HybridRetriever and Generator so EACH sub-component
+             records its own span, then calls tracer.flush(ctx) at the end.
 
-    You only need to interact with RAGPipeline — it handles all the rest.
+    The result: one rich JSON record per query with the complete span tree:
+        bm25 → vector → rrf_fusion → rerank → generation
+    And a matching nested trace in Langfuse showing the visual timeline.
 
-    Phase 1: Retriever used vector search only (bi-encoder similarity)
-    Phase 2: HybridRetriever uses BM25 + vector + RRF + cross-encoder re-ranking
-    Phase 3: Added tracing (Langfuse / local JSONL) for observability
-
-TWO MAIN OPERATIONS (unchanged API):
-    1. .ingest(source, doc_type)  — Add documents (also refreshes BM25 index)
-    2. .query(question)           — Hybrid search → re-rank → cite → answer
+WHAT YOU SEE IN LANGFUSE AFTER PHASE 4:
+    Traces tab → click any trace → span timeline:
+        rag-query         (7.4s)
+          retrieval       (512ms)
+            bm25          (12ms)  ← candidates=10, top BM25 scores
+            vector        (38ms)  ← candidates=10, top cosine scores
+            rrf_fusion     (2ms)  ← fused=12, top RRF scores
+            rerank        (340ms) ← kept=3, before/after comparison
+          llm-generation  (6.9s)  ← 847 in / 203 out tokens
 """
 
 import time
@@ -32,6 +33,7 @@ from src.generator import GeneratedAnswer, Generator
 from src.hybrid_retriever import HybridRetriever
 from src.ingestor import Document, get_ingestor
 from src.reranker import CrossEncoderReranker
+from src.trace_context import TraceContext
 from src.tracer import RAGTracer
 from src.vector_store import RetrievedChunk, VectorStore
 from config import settings
@@ -44,37 +46,36 @@ class RAGResponse:
     """Everything your system produces for a single query."""
     question: str
     answer: str
-    sources: List[str]                       # Paths/URLs of documents consulted
-    retrieved_chunks: List[RetrievedChunk]   # Re-ranked chunks (for debugging)
+    sources: List[str]
+    retrieved_chunks: List[RetrievedChunk]
     model: str
     prompt_version: str
-    citation_enforced: bool                  # True if the system declined to answer
-    # Phase 3: Timing
+    citation_enforced: bool
+    # Phase 4: timing and token details
     retrieval_latency_ms: float = 0.0
     generation_latency_ms: float = 0.0
     total_latency_ms: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    trace_id: str = ""
 
 
 # ─── Pipeline ─────────────────────────────────────────────────────────────────
 
 class RAGPipeline:
     """
-    The main entry point for the RAG system (Phase 3: Hybrid + Tracing).
+    The main entry point for the RAG system (Phase 4: Full span-based tracing).
 
-    Usage:
-        pipeline = RAGPipeline()
-
-        # Ingest documents
-        pipeline.ingest("docs/paper.pdf", "pdf")
-
-        # Query with hybrid retrieval + re-ranking + tracing
-        response = pipeline.query("What is the main contribution?")
-        print(response.answer)
-        print(f"  Took {response.total_latency_ms:.0f}ms")
+    Every call to .query() now:
+        1. Creates a TraceContext at the top
+        2. Passes it into HybridRetriever.retrieve() and Generator.generate()
+        3. Each sub-component records its own span (bm25, vector, rrf, rerank, gen)
+        4. tracer.flush() writes the full span tree to Langfuse + local JSONL
     """
 
     def __init__(self):
-        print("\n🚀 Initializing RAG Pipeline (Phase 3 — Hybrid + Tracing)...")
+        print("\n🚀 Initializing RAG Pipeline (Phase 4 — Full Tracing)...")
         print("=" * 65)
 
         self._chunker = Chunker(
@@ -95,7 +96,7 @@ class RAGPipeline:
             reranker=self._reranker,
         )
         self._generator = Generator()
-        self._tracer = RAGTracer()   # Phase 3: observability
+        self._tracer = RAGTracer()
 
         print("=" * 65)
         print(
@@ -111,104 +112,82 @@ class RAGPipeline:
     def ingest(self, source: str, doc_type: str) -> int:
         """
         Ingest a document into the knowledge base.
-
-        Args:
-            source: File path or URL.
-            doc_type: 'pdf', 'markdown', 'md', 'web', 'url'.
-
-        Returns:
-            Number of chunks added.
+        (Unchanged from Phase 3 — ingest is not traced per-span.)
         """
         print(f"\n📥 Ingesting: '{source}' (type={doc_type})")
         print("-" * 55)
 
-        # Step 1: Load
         ingestor = get_ingestor(doc_type)
         document: Document = ingestor.ingest(source)
         print(f"  ✓ Loaded ({len(document.content):,} chars)")
 
-        # Step 2: Chunk
         chunks = self._chunker.chunk(document)
 
-        # Step 3: Embed
         print(f"  ⟳ Embedding {len(chunks)} chunks...")
         embeddings = self._embedder.embed([c.text for c in chunks])
         print(f"  ✓ {len(embeddings)} embeddings generated")
 
-        # Step 4: Store in ChromaDB
         self._vector_store.add_chunks(chunks, embeddings)
-
-        # Step 5: Refresh BM25 index
         self._bm25_store.refresh()
 
         print(f"\n✅ Done! {len(chunks)} chunks added. "
               f"Total: {self._vector_store.count()}")
         return len(chunks)
 
-    # ── QUERY PATH ────────────────────────────────────────────────────────────
+    # ── QUERY PATH (fully traced) ─────────────────────────────────────────────
 
     def query(self, question: str, top_k: Optional[int] = None) -> RAGResponse:
         """
         Answer a question using the full hybrid RAG pipeline.
 
-        Phase 3 addition: Starts a trace, records retrieval + generation
-        latency, and flushes to Langfuse / local JSONL on completion.
+        Phase 4 upgrade:
+            - Creates a TraceContext and passes it into every sub-component
+            - Measures wall-clock time for retrieval and generation separately
+            - Flushes the full span tree to Langfuse + local JSONL after generation
 
-        Steps:
-            1. Hybrid retrieve: BM25 + vector → RRF → cross-encoder re-rank
-            2. Citation enforcement: empty result → decline answer
-            3. Generate: send re-ranked chunks to Ollama → cited answer
-            4. Trace: record all telemetry and flush
-
-        Args:
-            question: Plain English question.
-            top_k: Override for number of chunks after re-ranking.
-
-        Returns:
-            RAGResponse with answer, citations, and timing info.
+        Returned RAGResponse now includes trace_id (so you can look it up
+        in Langfuse), and prompt/completion/total token counts.
         """
         print(f"\n❓ Question: '{question}'")
         print("-" * 55)
 
-        # ── Phase 3: Start trace ───────────────────────────────────────────────
-        trace = self._tracer.start(question)
+        # ── Create the trace context for this query ────────────────────────────
+        # One TraceContext per query — lives only for the duration of this call
+        ctx = TraceContext(question)
 
-        # ── Step 1: Hybrid retrieval ───────────────────────────────────────────
-        t_retrieval_start = time.time()
-        retrieved_chunks = self._hybrid_retriever.retrieve(question, top_k=top_k)
-        retrieval_ms = (time.time() - t_retrieval_start) * 1000
+        # ── Step 1: Hybrid retrieval (BM25 + vector + RRF + rerank) ───────────
+        t_retrieval_start = time.monotonic()
+        retrieved_chunks = self._hybrid_retriever.retrieve(
+            question,
+            top_k=top_k,
+            trace_ctx=ctx,          # ← all sub-spans recorded inside retrieve()
+        )
+        retrieval_ms = (time.monotonic() - t_retrieval_start) * 1000
 
         citation_enforced = len(retrieved_chunks) == 0
 
-        # Log retrieval to trace
-        top_score = retrieved_chunks[0].score if retrieved_chunks else 0.0
-        trace.log_retrieval(
-            bm25_count=self._bm25_store.doc_count,
-            vector_count=self._vector_store.count(),
-            fused_count=len(retrieved_chunks),
-            final_count=len(retrieved_chunks),
-            top_rerank_score=top_score,
-            citation_enforced=citation_enforced,
-        )
-
         # ── Step 2: Generate ───────────────────────────────────────────────────
-        t_gen_start = time.time()
-        generated: GeneratedAnswer = self._generator.generate(question, retrieved_chunks)
-        generation_ms = (time.time() - t_gen_start) * 1000
+        t_gen_start = time.monotonic()
+        generated: GeneratedAnswer = self._generator.generate(
+            question,
+            retrieved_chunks,
+            trace_ctx=ctx,          # ← "generation" span recorded inside generate()
+        )
+        generation_ms = (time.monotonic() - t_gen_start) * 1000
+        total_ms = retrieval_ms + generation_ms
 
-        # Log generation to trace
-        trace.log_generation(
-            answer=generated.answer,
+        # ── Step 3: Flush the complete span tree ───────────────────────────────
+        self._tracer.flush(
+            ctx,
+            total_latency_ms=total_ms,
+            citation_enforced=citation_enforced,
             sources=generated.sources,
-            prompt_version=generated.prompt_version,
         )
 
-        # ── Flush trace ────────────────────────────────────────────────────────
-        self._tracer.finish(trace)
-
-        total_ms = retrieval_ms + generation_ms
-        print(f"\n  ⏱ Latency: retrieval={retrieval_ms:.0f}ms  "
-              f"generation={generation_ms:.0f}ms  total={total_ms:.0f}ms")
+        print(f"\n  📊 Trace: {ctx.trace_id[:8]}... | "
+              f"retrieval={retrieval_ms:.0f}ms | "
+              f"generation={generation_ms:.0f}ms | "
+              f"tokens={generated.total_tokens}")
 
         return RAGResponse(
             question=question,
@@ -221,6 +200,10 @@ class RAGPipeline:
             retrieval_latency_ms=round(retrieval_ms, 1),
             generation_latency_ms=round(generation_ms, 1),
             total_latency_ms=round(total_ms, 1),
+            prompt_tokens=generated.prompt_tokens,
+            completion_tokens=generated.completion_tokens,
+            total_tokens=generated.total_tokens,
+            trace_id=ctx.trace_id,
         )
 
     @property

@@ -55,13 +55,19 @@ A production-grade **Retrieval Augmented Generation (RAG)** system built with Py
                     │Re-Ranker           │    (re-scores top chunks)
                     └──────────┬─────────┘
                                ▼
-                    ┌────────────────────┐
-                    │Citation Enforcement│  ← If best score < threshold,
-                    │Threshold           │    decline to answer
-                    └──────────┬─────────┘
-                               ▼
-                          (Generator)
-```
+                     ┌────────────────────┐
+                     │Citation Enforcement│  ← If best score < threshold,
+                     │Threshold           │    decline to answer
+                     └──────────┬─────────┘
+                                ▼
+                           (Generator)
+
+### Phase 3 & 4: Evaluation & Full-Span Observability
+*Added automated quality gates and deep nested trace contexts.*
+- Every query generates a `TraceContext`.
+- Individual spans are timed: `bm25`, `vector`, `rrf_fusion`, `rerank`, `generation`.
+- The full span tree (with input/output token metrics) is flushed to **Langfuse** (for visual timelines) or a local JSONL fallback.
+- **Evaluation** is done via `evals/run_evals.py` on a Golden Dataset to catch regressions.```
 
 ---
 
@@ -74,28 +80,30 @@ rag_system/
 │   ├── chunker.py          # Token-aware text splitting (800t / 100t overlap)
 │   ├── embedder.py         # sentence-transformers: all-MiniLM-L6-v2
 │   ├── vector_store.py     # ChromaDB wrapper (cosine similarity)
-│   ├── bm25_store.py       # 🆕 Lexical keyword search index (Phase 2)
+│   ├── bm25_store.py       # Lexical keyword search index (Phase 2)
 │   ├── retriever.py        # Basic semantic search (Phase 1)
-│   ├── hybrid_retriever.py # 🆕 BM25 + Vector + RRF fusion (Phase 2)
-│   ├── reranker.py         # 🆕 cross-encoder precision re-ranking (Phase 2)
-│   ├── tracer.py           # 🆕 Langfuse / local JSONL observability (Phase 3)
-│   ├── generator.py        # Ollama LLM answer generation with citations
+│   ├── hybrid_retriever.py # BM25 + Vector + RRF fusion (Phase 2, instrumented P4)
+│   ├── reranker.py         # Cross-encoder precision re-ranking (Phase 2)
+│   ├── trace_context.py    # 🆕 Span collector passed through call chain (Phase 4)
+│   ├── tracer.py           # Langfuse / local JSONL observability (Phase 3+4)
+│   ├── generator.py        # Ollama LLM + tiktoken token counting (Phase 4)
 │   └── rag_pipeline.py     # Top-level orchestrator
 ├── prompts/
 │   └── prompts.yaml        # ⭐ Version-controlled prompt templates
-├── evals/                    # 🆕 Phase 3: Evaluation framework
+├── evals/                    # Phase 3: Evaluation framework
 │   ├── golden_dataset.jsonl  # 8 grounded Q&A pairs for regression testing
 │   ├── metrics.py            # Scoring: contains_check, token_f1, faithfulness
 │   └── run_evals.py          # CLI runner — scores all golden questions
-├── traces/                   # (gitignored) Per-query telemetry JSONL
+├── traces/                   # (gitignored) Per-query span tree JSONL
 ├── tests/
-│   ├── conftest.py              # Shared fixtures + Ollama availability check
+│   ├── conftest.py
 │   ├── test_chunker.py
 │   ├── test_retriever.py
 │   ├── test_generator.py
-│   ├── test_hybrid_retriever.py # RRF and BM25 tests
-│   ├── test_reranker.py         # Citation enforcement tests
-│   └── test_evaluation.py       # 🆕 Quality gate tests
+│   ├── test_hybrid_retriever.py
+│   ├── test_reranker.py
+│   ├── test_evaluation.py    # Quality gate tests
+│   └── test_tracer.py        # 🆕 SpanTimer + TraceContext + JSONL writer (Phase 4)
 
 ├── docs/
 │   └── transformer_architecture.md  # Sample document for testing
@@ -227,15 +235,15 @@ python evals/run_evals.py
 
 Expected output:
 ```
-tests/test_chunker.py::TestChunker::test_produces_multiple_chunks PASSED
+tests/test_chunker.py::TestChunker::... PASSED
+tests/test_evaluation.py::TestMetrics::... PASSED
+tests/test_tracer.py::TestSpanTimer::... PASSED
+tests/test_tracer.py::TestTraceContext::... PASSED
+tests/test_tracer.py::TestRAGTracerLocal::... PASSED
+tests/test_hybrid_retriever.py::TestRRF::... PASSED
+tests/test_reranker.py::TestCrossEncoderReranker::... PASSED
 ...
-tests/test_evaluation.py::TestMetrics::test_contains_all_present PASSED
-tests/test_evaluation.py::TestMetrics::test_token_f1_perfect_match PASSED
-...
-tests/test_hybrid_retriever.py::TestRRF::test_document_in_both_lists_ranks_higher PASSED
-tests/test_reranker.py::TestCrossEncoderReranker::test_citation_enforcement_fires_when_below_threshold PASSED
-...
-====== 53 passed, 4 deselected (eval skipped — Ollama not running) ======
+====== 73 passed, 4 deselected (eval tests auto-skip without Ollama) ======
 ```
 
 ---
@@ -296,7 +304,10 @@ If the highest-scoring chunk from the cross-encoder falls below a threshold, the
 A golden dataset is a curated set of question-answer pairs that encode your quality expectations as executable contracts. Every time you change a prompt, chunk size, or model, run `evals/run_evals.py` to check you haven't regressed. It's the difference between **hoping** your change helped and **knowing** it did.
 
 ### What is LLM Observability? (Phase 3)
-Every query your system handles generates rich telemetry: retrieval latency, re-ranker scores, number of chunks retrieved, citation enforcement rate. Without capturing this, you're operating blind. Langfuse (or the local JSONL fallback) makes every query inspectable, enabling you to catch regressions, optimize slow queries, and track quality over time.
+Every query your system handles generates rich telemetry: retrieval latency, re-ranker scores, number of chunks retrieved, citation enforcement rate. Without capturing this, you're operating blind. Phase 3 introduced basic query-level logging to catch regressions and track quality over time.
+
+### What is Span-Based Tracing? (Phase 4)
+Instead of just logging the total time a query took (Phase 3), span-based tracing creates a nested tree of every sub-operation. When a query is slow, you don't just know it was slow—you can see exactly that `bm25` took 12ms, `vector` took 38ms, `rerank` took 340ms, and `generation` took 6.9s. We pass a `TraceContext` down the entire call chain to build this "glass box", which is crucial for optimizing operations and token usage in production.
 
 ### Two Types of Tests in Production AI
 - **Unit/integration tests** (`pytest tests/ -m "not eval"`) — verify code correctness, run in CI in seconds, no GPU needed
@@ -310,7 +321,8 @@ Every query your system handles generates rich telemetry: retrieval latency, re-
 |-------|--------|---------|
 | Phase 1 | ✅ **Complete** | Core RAG pipeline, PDF/MD/Web ingestion, citations, tests |
 | Phase 2 | ✅ **Complete** | Hybrid BM25 + vector search, RRF fusion, cross-encoder re-ranking, citation enforcement |
-| Phase 3 | ✅ **Complete** | Langfuse tracing, golden eval dataset, quality gate tests, per-query latency tracking |
+| Phase 3 | ✅ **Complete** | Langfuse integration, golden eval dataset, quality gate tests |
+| Phase 4 | ✅ **Complete** | Full span-based tracing (`TraceContext`, `SpanTimer`), detailed nested Langfuse timelines, token counting |
 
 ---
 

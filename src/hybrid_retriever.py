@@ -1,60 +1,43 @@
 """
-src/hybrid_retriever.py — Hybrid Retrieval with Reciprocal Rank Fusion
+src/hybrid_retriever.py — Hybrid Retrieval with Reciprocal Rank Fusion (Phase 4)
 
-WHAT IS HYBRID RETRIEVAL?
-    Combining TWO search strategies:
-        1. BM25 (keyword search)  — finds chunks with matching WORDS
-        2. Vector search          — finds chunks with matching MEANING
+WHAT CHANGED FROM PHASE 3?
+    Added optional `trace_ctx` parameter to .retrieve().
+    Now records five spans for every query:
 
-    Then fusing their ranked lists into a single ranked list using
-    Reciprocal Rank Fusion (RRF).
+        "bm25"       — keyword candidates, BM25 scores for top-5
+        "vector"     — semantic candidates, cosine scores for top-5
+        "rrf_fusion" — merged candidate count, top-5 RRF scores
+        "rerank"     — before/after comparison: shows how re-ranking
+                       changes the order, plus citation enforcement result
 
-    Final step: Re-ranking with a cross-encoder for precision.
+    This is the "glass box" upgrade. You can now answer:
+        "Why was chunk 4 the top result even though BM25 didn't rank it first?"
+        "Did citation enforcement fire? What was the highest score it saw?"
+        "How long did the cross-encoder take vs. vector retrieval?"
 
-WHY HYBRID IS BETTER THAN EITHER ALONE:
-    ┌─────────────────────┬──────────────────────────────────────────────┐
-    │ Scenario            │ Which search wins                            │
-    ├─────────────────────┼──────────────────────────────────────────────┤
-    │ "What is attention?"│ Vector (semantic, finds explanations)        │
-    │ "HTTP 404 error"    │ BM25 (finds exact code/term matches)         │
-    │ "Vaswani et al."    │ BM25 (author name = exact keyword match)     │
-    │ "Main idea of paper"│ Vector (conceptual query)                    │
-    └─────────────────────┴──────────────────────────────────────────────┘
+WHY THE BEFORE/AFTER RERANK LOG IS VALUABLE:
+    Before rerank (RRF order):
+        chunk_5: rrf=0.03247 | transformer_architecture.md
+        chunk_2: rrf=0.03101 | transformer_architecture.md
+        chunk_8: rrf=0.01600 | transformer_architecture.md
 
-RECIPROCAL RANK FUSION (RRF):
-    For each document d, across ranking systems s1, s2:
-        RRF_score(d) = Σ  1 / (k + rank_s(d))
-                       s∈{bm25, vector}
+    After rerank (cross-encoder order):
+        chunk_2: ce_score=0.93 ← moved UP (RRF undervalued it)
+        chunk_5: ce_score=0.71 ← stayed high
+        chunk_8: ce_score=0.12 ← dropped (almost below citation threshold)
 
-    where k=60 is a constant (standard choice, validated in literature).
-
-    Example:
-        Doc A: BM25 rank 1, Vector rank 3  → 1/(60+1) + 1/(60+3) = 0.032
-        Doc B: BM25 rank 5, Vector rank 1  → 1/(60+5) + 1/(60+1) = 0.032
-        Doc C: BM25 rank 2, Vector rank 2  → 1/(60+2) + 1/(60+2) = 0.032
-
-    RRF promotes documents that rank well in BOTH systems over documents
-    that rank first in only one. This is why it's powerful.
-
-PIPELINE:
-    query
-      │
-      ├── BM25 search  → top 10 [keyword candidates]
-      ├── Vector search → top 10 [semantic candidates]
-      │
-      ├── RRF fusion   → merged top 10 [best of both worlds]
-      │
-      └── Cross-encoder re-ranking → top 3 [precision-filtered]
-                                         ↓
-                                    Citation enforcement
-                                    (decline if below threshold)
+    This is the verification that re-ranking actually helps — without this
+    log you can't tell if the cross-encoder is doing useful work.
 """
 
+import time
 from typing import Dict, List, Optional, Tuple
 
 from src.bm25_store import BM25Store
 from src.embedder import Embedder
 from src.reranker import CrossEncoderReranker
+from src.trace_context import TraceContext, SpanTimer
 from src.vector_store import RetrievedChunk, VectorStore
 from config import settings
 
@@ -69,30 +52,22 @@ def _reciprocal_rank_fusion(
     Merge multiple ranked lists using Reciprocal Rank Fusion.
 
     Args:
-        rankings: List of ranked lists (each list is one retriever's results).
-        k: RRF constant (60 is the standard, from the original 2009 paper).
+        rankings: List of ranked lists (each is one retriever's results).
+        k: RRF constant (60 from the original 2009 paper).
 
     Returns:
-        Single merged list, sorted by RRF score descending.
-        Scores are stored in the .score field of RetrievedChunk.
+        Single merged list sorted by RRF score descending.
     """
-    # Map from unique chunk identity → accumulated RRF score + original chunk
     rrf_scores: Dict[str, float] = {}
     chunk_map: Dict[str, RetrievedChunk] = {}
 
     for ranked_list in rankings:
         for rank, chunk in enumerate(ranked_list):
-            # Use source + chunk_index as the unique key for this chunk
             chunk_id = f"{chunk.source}::chunk_{chunk.chunk_index}"
-
-            # Accumulate the RRF contribution from this ranking list
             rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
-
-            # Keep the chunk object (from whichever list we saw it first)
             if chunk_id not in chunk_map:
                 chunk_map[chunk_id] = chunk
 
-    # Build result list sorted by accumulated RRF score
     merged = []
     for chunk_id, rrf_score in sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True):
         chunk = chunk_map[chunk_id]
@@ -101,7 +76,7 @@ def _reciprocal_rank_fusion(
                 text=chunk.text,
                 source=chunk.source,
                 chunk_index=chunk.chunk_index,
-                score=round(rrf_score, 6),   # RRF score replaces original score
+                score=round(rrf_score, 6),
                 metadata=chunk.metadata,
             )
         )
@@ -115,11 +90,7 @@ class HybridRetriever:
     """
     Production retriever: BM25 + Vector Search + RRF + Cross-Encoder Re-Ranking.
 
-    This is the core of Phase 2 and represents how enterprise RAG systems
-    actually work in production. The three stages are:
-        1. Recall:    BM25 + vector search get a broad candidate set
-        2. Fusion:    RRF merges them fairly
-        3. Precision: cross-encoder re-ranks for accuracy + citation enforcement
+    Phase 4: All stages timed individually and recorded to trace_ctx when provided.
     """
 
     def __init__(
@@ -139,23 +110,20 @@ class HybridRetriever:
         query: str,
         top_k: Optional[int] = None,
         candidate_k: Optional[int] = None,
+        trace_ctx: Optional[TraceContext] = None,
     ) -> List[RetrievedChunk]:
         """
         Run the full hybrid retrieval pipeline.
 
         Args:
-            query: User's question in plain English.
-            top_k: Final number of chunks after re-ranking.
-                   Defaults to settings.reranker_top_k.
-            candidate_k: How many candidates each retriever fetches before fusion.
-                         Defaults to settings.top_k * 2 (cast a wider net).
+            query: User's question.
+            top_k: Final chunks to keep after re-ranking.
+            candidate_k: Candidates to fetch per retriever before fusion.
+            trace_ctx: Optional Phase 4 trace context. When provided, each
+                       retrieval stage records its own span with timing and scores.
 
         Returns:
-            Re-ranked list of RetrievedChunk objects, most relevant first.
-            Returns empty list if citation enforcement threshold is not met.
-
-        Raises:
-            ValueError: If the vector store is empty.
+            Re-ranked RetrievedChunk list (empty if citation enforcement fires).
         """
         if self._vector_store.count() == 0:
             raise ValueError(
@@ -164,31 +132,75 @@ class HybridRetriever:
             )
 
         k = top_k or settings.reranker_top_k
-        # Fetch more candidates than we'll keep — gives RRF more material to work with
         ck = candidate_k or (settings.top_k * 2)
 
         print(f"\n  ⟳ HYBRID RETRIEVAL for: '{query[:60]}...'")
         print(f"     Candidate pool: {ck} per retriever → RRF → re-rank to {k}")
 
         # ── Stage 1a: BM25 keyword retrieval ──────────────────────────────────
-        bm25_results = self._bm25_store.search(query, top_k=ck)
-        print(f"  ✓ BM25: {len(bm25_results)} candidates")
+        with SpanTimer() as bm25_timer:
+            bm25_results = self._bm25_store.search(query, top_k=ck)
+
+        print(f"  ✓ BM25: {len(bm25_results)} candidates in {bm25_timer.elapsed_ms:.0f}ms")
+
+        if trace_ctx is not None:
+            trace_ctx.record(
+                name="bm25",
+                latency_ms=bm25_timer.elapsed_ms,
+                input={"query": query, "top_k": ck},
+                output={
+                    "candidates": len(bm25_results),
+                    "top_scores": [round(c.score, 4) for c in bm25_results[:5]],
+                    "top_sources": [c.source.split("/")[-1] for c in bm25_results[:5]],
+                },
+            )
 
         # ── Stage 1b: Vector semantic retrieval ───────────────────────────────
-        query_embedding = self._embedder.embed_single(query)
-        vector_results = self._vector_store.query(query_embedding, top_k=ck)
-        print(f"  ✓ Vector: {len(vector_results)} candidates")
+        with SpanTimer() as vec_timer:
+            query_embedding = self._embedder.embed_single(query)
+            vector_results = self._vector_store.query(query_embedding, top_k=ck)
+
+        print(f"  ✓ Vector: {len(vector_results)} candidates in {vec_timer.elapsed_ms:.0f}ms")
+
+        if trace_ctx is not None:
+            trace_ctx.record(
+                name="vector",
+                latency_ms=vec_timer.elapsed_ms,
+                input={"query": query, "top_k": ck},
+                output={
+                    "candidates": len(vector_results),
+                    "top_scores": [round(c.score, 4) for c in vector_results[:5]],
+                    "top_sources": [c.source.split("/")[-1] for c in vector_results[:5]],
+                },
+            )
 
         if not bm25_results and not vector_results:
             return []
 
         # ── Stage 2: Reciprocal Rank Fusion ───────────────────────────────────
-        # Only pass non-empty rankings to avoid RRF treating missing as rank 0
-        rankings_to_fuse = [r for r in [bm25_results, vector_results] if r]
-        fused = _reciprocal_rank_fusion(rankings_to_fuse)
-        print(f"  ✓ RRF: merged into {len(fused)} unique candidates")
+        with SpanTimer() as rrf_timer:
+            rankings_to_fuse = [r for r in [bm25_results, vector_results] if r]
+            fused = _reciprocal_rank_fusion(rankings_to_fuse)
 
-        # Show the top candidates before re-ranking (for transparency)
+        print(f"  ✓ RRF: {len(fused)} unique candidates in {rrf_timer.elapsed_ms:.0f}ms")
+
+        if trace_ctx is not None:
+            trace_ctx.record(
+                name="rrf_fusion",
+                latency_ms=rrf_timer.elapsed_ms,
+                input={
+                    "bm25_count": len(bm25_results),
+                    "vector_count": len(vector_results),
+                    "k_constant": 60,
+                },
+                output={
+                    "fused_count": len(fused),
+                    "top_rrf_scores": [round(c.score, 6) for c in fused[:5]],
+                    "top_sources": [c.source.split("/")[-1] for c in fused[:5]],
+                },
+            )
+
+        # Print top-5 pre-rerank for transparency
         for i, chunk in enumerate(fused[:5], 1):
             print(
                 f"    [{i}] rrf={chunk.score:.5f} | "
@@ -196,18 +208,51 @@ class HybridRetriever:
             )
 
         # ── Stage 3: Cross-Encoder Re-Ranking + Citation Enforcement ──────────
-        ranked = self._reranker.rerank(query, fused, top_k=k)
+        # Save the pre-rerank order so we can log the before/after comparison
+        pre_rerank_snapshot = [
+            {"source": c.source.split("/")[-1], "chunk_idx": c.chunk_index,
+             "rrf_score": round(c.score, 6)}
+            for c in fused[:10]
+        ]
 
-        if not ranked:
-            # Citation enforcement triggered: return empty (generator will decline)
+        with SpanTimer() as rerank_timer:
+            ranked = self._reranker.rerank(query, fused, top_k=k)
+
+        citation_fired = len(ranked) == 0
+
+        if trace_ctx is not None:
+            post_rerank_snapshot = [
+                {"source": r.source.split("/")[-1],
+                 "chunk_idx": r.chunk_index,
+                 "ce_score": round(r.rerank_score, 4)}
+                for r in ranked
+            ] if ranked else []
+
+            trace_ctx.record(
+                name="rerank",
+                latency_ms=rerank_timer.elapsed_ms,
+                input={
+                    "input_count": len(fused),
+                    "target_top_k": k,
+                    "citation_threshold": settings.citation_score_threshold,
+                    "before_rerank": pre_rerank_snapshot,
+                },
+                output={
+                    "kept_count": len(ranked),
+                    "citation_enforced": citation_fired,
+                    "top_score": round(ranked[0].rerank_score, 4) if ranked else 0.0,
+                    "after_rerank": post_rerank_snapshot,
+                },
+            )
+
+        if citation_fired:
             return []
 
-        # Convert back to RetrievedChunks for the generator
         final = self._reranker.to_retrieved_chunks(ranked)
-        print(f"  ✓ Final: {len(final)} chunks after re-ranking")
+        print(f"  ✓ Final: {len(final)} chunks after re-ranking "
+              f"in {rerank_timer.elapsed_ms:.0f}ms")
 
         return final
 
     def refresh_bm25(self) -> None:
-        """Refresh the BM25 index after new documents are ingested."""
         self._bm25_store.refresh()

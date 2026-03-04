@@ -1,40 +1,51 @@
 """
-src/generator.py — Answer Generation Module
+src/generator.py — Answer Generation Module (Phase 4: Instrumented)
 
-WHAT DOES THE GENERATOR DO?
-    Takes the retrieved chunks + user's question and sends them to the
-    local Ollama LLM to produce a cited, grounded answer.
+WHAT CHANGED FROM PHASE 3?
+    Added optional `trace_ctx` parameter to .generate().
+    When provided, it records to the "generation" span:
+        - The exact rendered prompt (first 500 chars as preview)
+        - Prompt token count  (via tiktoken cl100k_base)
+        - Completion token count
+        - Total token count
+        - The answer preview (first 500 chars)
+        - Generation latency
 
-THE RAG GENERATION PATTERN:
-    Instead of asking the LLM: "What is X?"
-    We ask: "Given THESE SPECIFIC TEXTS from documents, what is X?"
+WHY TOKEN COUNTING MATTERS:
+    Even with a free local model, token count is a proxy for:
+        - Latency correlation: more tokens → slower generation
+        - Quality sanity check: too few tokens → truncated answer?
+        - Phase 5 cost estimation placeholder (swap in an API cost
+          per-token later if you move to GPT-4 or Claude)
 
-    This is the key insight of RAG:
-      - Without RAG: LLM answers from its training data (may be outdated/
-        hallucinated)
-      - With RAG: LLM answers ONLY from retrieved evidence (grounded,
-        citable, trustworthy)
-
-CITATION MECHANISM:
-    Each chunk carries its source file path. We inject this into the context
-    as "Source: filename.pdf | Chunk 3" so the model can reference it
-    in its answer. The output includes a deduplicated list of all sources
-    that were used to generate the answer.
-
-PROMPT VERSIONING:
-    The actual prompt template lives in prompts/prompts.yaml — not hardcoded
-    here. This is the "engineering maturity" that makes prompts auditable.
+    We use tiktoken's cl100k_base encoding because it closely matches
+    how most modern LLMs (including llama series) tokenize text.
+    Exact token counts differ by model, but estimates are close enough.
 """
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+import tiktoken
 import yaml
 from langchain_ollama import OllamaLLM
 
+from src.trace_context import TraceContext, SpanTimer
 from src.vector_store import RetrievedChunk
 from config import settings
+
+
+# ─── Token Counter (module-level, cached once) ────────────────────────────────
+# cl100k_base is the tokenizer for GPT-4 and a reasonable proxy for any
+# modern LLM. Load once at import time.
+_TOKENIZER = tiktoken.get_encoding("cl100k_base")
+
+
+def _count_tokens(text: str) -> int:
+    """Count approximate tokens in a string using the cl100k_base tokenizer."""
+    return len(_TOKENIZER.encode(text))
 
 
 # ─── Data Models ──────────────────────────────────────────────────────────────
@@ -42,17 +53,20 @@ from config import settings
 @dataclass
 class GeneratedAnswer:
     """The complete output from the RAG generator."""
-    answer: str                         # The LLM's answer text
-    sources: List[str]                  # Deduplicated list of source files cited
-    retrieved_chunks: List[RetrievedChunk]  # The raw chunks that were used
-    model: str                          # Which model generated this answer
-    prompt_version: str                 # Which prompt version was used
+    answer: str
+    sources: List[str]
+    retrieved_chunks: List[RetrievedChunk]
+    model: str
+    prompt_version: str
+    # Phase 4 additions:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 # ─── Prompt Loader ────────────────────────────────────────────────────────────
 
 def _load_prompts() -> dict:
-    """Load prompt templates from prompts/prompts.yaml."""
     prompts_path = Path(__file__).parent.parent / "prompts" / "prompts.yaml"
     with open(prompts_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -64,13 +78,12 @@ class Generator:
     """
     Uses a local Ollama LLM to generate cited answers from retrieved chunks.
 
-    OLLAMA INTEGRATION:
-        Ollama runs a local server (http://localhost:11434) that exposes
-        your locally-pulled models via a REST API. LangChain's OllamaLLM
-        talks to that server automatically.
-
-        You never need an internet connection or API key once the model is
-        pulled locally with `ollama pull llama3.2:3b`.
+    Phase 4 addition:
+        - Accepts optional trace_ctx; records a "generation" span with:
+            prompt token count, response token count, prompt preview,
+            answer preview.
+        - Token counts are also returned in GeneratedAnswer for Phase 5
+          cost/usage tracking.
     """
 
     def __init__(self):
@@ -83,7 +96,7 @@ class Generator:
         self._llm = OllamaLLM(
             model=settings.ollama_model,
             base_url=settings.ollama_base_url,
-            temperature=0.1,   # Low temperature = more factual, less creative
+            temperature=0.1,
         )
         print(f"  ✓ Generator ready (model={settings.ollama_model}, temp=0.1)")
 
@@ -91,19 +104,21 @@ class Generator:
         self,
         question: str,
         retrieved_chunks: List[RetrievedChunk],
+        trace_ctx: Optional[TraceContext] = None,
     ) -> GeneratedAnswer:
         """
         Generate a cited answer from the retrieved chunks.
 
         Args:
-            question: The user's question in plain English.
-            retrieved_chunks: Chunks from the retriever.
+            question: The user's question.
+            retrieved_chunks: Re-ranked chunks from hybrid retriever.
+            trace_ctx: Optional trace context (Phase 4). When provided,
+                       records a "generation" span with prompt + token data.
 
         Returns:
-            GeneratedAnswer with the answer text and source citations.
+            GeneratedAnswer with answer, sources, and token counts.
         """
         if not retrieved_chunks:
-            # No chunks means the vector store is empty or query found nothing
             fallback = self._no_context_template
             return GeneratedAnswer(
                 answer=fallback,
@@ -113,46 +128,77 @@ class Generator:
                 prompt_version=self._prompt_version,
             )
 
-        # ── Build the context string from retrieved chunks ─────────────────
-        # Format each chunk with a header showing where it came from.
-        # This is what gets injected into {context} in the prompt.
+        # ── Build the context block ────────────────────────────────────────────
         context_parts = []
         for i, chunk in enumerate(retrieved_chunks, 1):
-            source_name = Path(chunk.source).name  # Just the filename, not full path
+            source_name = Path(chunk.source).name
             header = f"[Chunk {i} | Source: {source_name} | Score: {chunk.score:.3f}]"
             context_parts.append(f"{header}\n{chunk.text}")
 
         context_block = "\n\n" + "\n\n---\n\n".join(context_parts) + "\n"
 
-        # ── Fill in the prompt template ────────────────────────────────────
+        # ── Render prompt ──────────────────────────────────────────────────────
         prompt = self._prompt_template.format(
             context=context_block,
             question=question,
         )
 
-        # ── Call the local LLM ─────────────────────────────────────────────
+        # ── Count prompt tokens BEFORE the LLM call ───────────────────────────
+        prompt_tokens = _count_tokens(prompt)
+
         print(f"\n  ⟳ Sending prompt to '{settings.ollama_model}'...")
         print(f"     Context: {len(retrieved_chunks)} chunks | "
-              f"~{sum(c.metadata.get('token_count', 0) for c in retrieved_chunks)} tokens")
+              f"~{prompt_tokens} prompt tokens")
 
-        answer_text = self._llm.invoke(prompt)
+        # ── Call the LLM (timed) ───────────────────────────────────────────────
+        with SpanTimer() as gen_timer:
+            answer_text = self._llm.invoke(prompt)
 
-        # ── Extract deduplicated sources ───────────────────────────────────
-        # Show unique sources so the user knows which documents were consulted
+        answer_text = answer_text.strip()
+
+        # ── Count completion tokens AFTER ──────────────────────────────────────
+        completion_tokens = _count_tokens(answer_text)
+        total_tokens = prompt_tokens + completion_tokens
+
+        print(f"  ✓ Answer: {completion_tokens} tokens in "
+              f"{gen_timer.elapsed_ms:.0f}ms "
+              f"(prompt={prompt_tokens}, total={total_tokens})")
+
+        # ── Record "generation" span ───────────────────────────────────────────
+        if trace_ctx is not None:
+            trace_ctx.record(
+                name="generation",
+                latency_ms=gen_timer.elapsed_ms,
+                input={
+                    "prompt_preview": prompt[:500],       # first 500 chars
+                    "prompt_tokens": prompt_tokens,
+                    "chunk_count": len(retrieved_chunks),
+                },
+                output={
+                    "answer_preview": answer_text[:500],  # first 500 chars
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "prompt_tokens": prompt_tokens,
+                },
+            )
+
+        # ── Extract deduplicated sources ───────────────────────────────────────
         seen = set()
         unique_sources = []
         for chunk in retrieved_chunks:
-            src = chunk.source
-            if src not in seen:
-                seen.add(src)
-                unique_sources.append(src)
+            if chunk.source not in seen:
+                seen.add(chunk.source)
+                unique_sources.append(chunk.source)
 
-        print(f"  ✓ Answer generated. Sources: {[Path(s).name for s in unique_sources]}")
+        print(f"  ✓ Sources: {[Path(s).name for s in unique_sources]}")
 
         return GeneratedAnswer(
-            answer=answer_text.strip(),
+            answer=answer_text,
             sources=unique_sources,
             retrieved_chunks=retrieved_chunks,
             model=settings.ollama_model,
             prompt_version=self._prompt_version,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
         )

@@ -1,6 +1,5 @@
 """
-src/tracer.py — Observability & Tracing (Phase 3)
-
+src/tracer.py — Observability Backend
 WHAT IS TRACING IN RAG SYSTEMS?
     Every query your system processes generates rich signal:
         - How long did retrieval take?
@@ -31,21 +30,62 @@ USAGE IN PIPELINE:
     trace.log_retrieval(chunks, latency_ms)
     trace.log_generation(answer, sources, latency_ms)
     tracer.finish(trace)
+    
+WHAT CHANGED FROM PHASE 3?
+    Phase 3: One log record per query (total latency, chunk count, top score)
+    Phase 4: A full span tree per query — every sub-step is individually timed
+             and logged, with inputs/outputs at each stage.
+
+BACKENDS:
+    1. Langfuse — visual dashboard with nested span timeline, token usage,
+                  latency histograms. Keys detected from .env automatically.
+    2. Local JSONL — always-on fallback, written to traces/traces.jsonl.
+                     Readable with any JSON tool, or the Phase 5 dashboard.
+
+HOW TO READ THE LANGFUSE DASHBOARD:
+    Go to cloud.langfuse.com → "Traces" tab.
+    Each query appears as one row. Click it to expand the span timeline:
+      ┌─────────────────────────────────────────────────────────┐
+      │ rag-query                               7412ms          │
+      │   retrieval                             512ms           │
+      │     bm25                     12ms                       │
+      │     vector                   38ms                       │
+      │     rrf_fusion                2ms                       │
+      │     rerank                  340ms                       │
+      │   generation                           6900ms           │
+      │     llm-call (847 in / 203 out tokens)                  │
+      └─────────────────────────────────────────────────────────┘
+    This is the "glass box" — you can see exactly where time is spent.
+
+LOCAL JSONL FORMAT:
+    Each line is one query. The span tree is nested under "spans":
+    {
+      "trace_id": "abc-123",
+      "question": "What is self-attention?",
+      "timestamp_utc": "2024-01-01T12:00:00Z",
+      "total_latency_ms": 7412,
+      "citation_enforced": false,
+      "sources": ["docs/transformer_architecture.md"],
+      "tokens": {"prompt_tokens": 847, "completion_tokens": 203, "total_tokens": 1050},
+      "spans": {
+        "bm25":       {"latency_ms": 12,   "input": {...}, "output": {...}},
+        "vector":     {"latency_ms": 38,   "input": {...}, "output": {...}},
+        "rrf_fusion": {"latency_ms": 2,    "input": {...}, "output": {...}},
+        "rerank":     {"latency_ms": 340,  "input": {...}, "output": {...}},
+        "generation": {"latency_ms": 6900, "input": {...}, "output": {...}}
+      }
+    }
 """
 
 import json
 import os
-import time
-import uuid
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from src.trace_context import TraceContext
 from config import settings
 
-# ─── Optional Langfuse import ─────────────────────────────────────────────────
-# Langfuse is optional — the system works without it.
-# Requires langfuse>=2.0.0,<3.0.0 (v2 API: .trace() / .span())
+# ─── Optional Langfuse ────────────────────────────────────────────────────────
 try:
     from langfuse import Langfuse
     _LANGFUSE_SDK_AVAILABLE = True
@@ -53,111 +93,17 @@ except ImportError:
     _LANGFUSE_SDK_AVAILABLE = False
 
 
-# ─── Trace Data Model ─────────────────────────────────────────────────────────
-
-@dataclass
-class QueryTrace:
-    """
-    All telemetry for a single RAG query.
-
-    Why log everything together?
-        Having one record per query means you can join on trace_id,
-        slice by prompt_version to compare before/after prompt changes,
-        and filter by citation_enforced to find hard queries.
-    """
-    trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    timestamp_utc: str = ""
-
-    # ── Input ──────────────────────────────────────────────────────────────────
-    question: str = ""
-    model: str = ""
-    prompt_version: str = ""
-
-    # ── Retrieval ─────────────────────────────────────────────────────────────
-    bm25_candidates: int = 0
-    vector_candidates: int = 0
-    fused_candidates: int = 0
-    final_chunk_count: int = 0        # After re-ranking
-    top_rerank_score: float = 0.0     # Highest normalized cross-encoder score
-    citation_enforced: bool = False   # True if system declined to answer
-
-    # ── Output ────────────────────────────────────────────────────────────────
-    answer_length_chars: int = 0
-    sources: List[str] = field(default_factory=list)
-
-    # ── Latency (ms) ──────────────────────────────────────────────────────────
-    retrieval_latency_ms: float = 0.0
-    generation_latency_ms: float = 0.0
-    total_latency_ms: float = 0.0
-
-
-# ─── Active Trace Context ─────────────────────────────────────────────────────
-
-class ActiveTrace:
-    """
-    Mutable trace context built up during a query.
-    Call log_retrieval() then log_generation(), then RAGTracer.finish().
-    """
-
-    def __init__(self, question: str):
-        self._data = QueryTrace(
-            timestamp_utc=_now_iso(),
-            question=question,
-            model=settings.ollama_model,
-        )
-        self._start_ms = _now_ms()
-        self._retrieval_end_ms: Optional[float] = None
-
-    def log_retrieval(
-        self,
-        bm25_count: int,
-        vector_count: int,
-        fused_count: int,
-        final_count: int,
-        top_rerank_score: float,
-        citation_enforced: bool,
-    ) -> None:
-        """Record retrieval stage telemetry."""
-        now = _now_ms()
-        self._data.bm25_candidates = bm25_count
-        self._data.vector_candidates = vector_count
-        self._data.fused_candidates = fused_count
-        self._data.final_chunk_count = final_count
-        self._data.top_rerank_score = top_rerank_score
-        self._data.citation_enforced = citation_enforced
-        self._data.retrieval_latency_ms = round(now - self._start_ms, 1)
-        self._retrieval_end_ms = now
-
-    def log_generation(
-        self,
-        answer: str,
-        sources: List[str],
-        prompt_version: str,
-    ) -> None:
-        """Record generation stage telemetry."""
-        now = _now_ms()
-        self._data.answer_length_chars = len(answer)
-        self._data.sources = sources
-        self._data.prompt_version = prompt_version
-        gen_start = self._retrieval_end_ms or self._start_ms
-        self._data.generation_latency_ms = round(now - gen_start, 1)
-        self._data.total_latency_ms = round(now - self._start_ms, 1)
-
-    @property
-    def data(self) -> QueryTrace:
-        return self._data
-
-
 # ─── RAG Tracer ───────────────────────────────────────────────────────────────
 
 class RAGTracer:
     """
-    The main tracer. Call .start() at the top of a query, build up the trace,
-    then call .finish() to persist it.
+    Consumes a completed TraceContext and writes to all configured backends.
 
-    Backends (auto-selected based on config):
-        - Langfuse if LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY are set
-        - Local JSONL file otherwise (traces/traces.jsonl)
+    Usage (in rag_pipeline.py):
+        tracer = RAGTracer()                     # init once
+        ctx = TraceContext(question)             # per-query
+        # ... pipeline runs, ctx.record() called by each component ...
+        tracer.flush(ctx, total_latency_ms=..., citation_enforced=..., sources=...)
     """
 
     def __init__(self):
@@ -166,69 +112,161 @@ class RAGTracer:
         self._local_path.parent.mkdir(exist_ok=True)
 
         if self._langfuse:
-            print("  ✓ Tracer: Langfuse backend active")
+            print("  ✓ Tracer: Langfuse backend active → cloud.langfuse.com")
         else:
             print(f"  ✓ Tracer: Local backend → {self._local_path}")
 
-    def start(self, question: str) -> ActiveTrace:
-        """Create and return a new trace context for a query."""
-        return ActiveTrace(question)
+    def flush(
+        self,
+        ctx: TraceContext,
+        total_latency_ms: float,
+        citation_enforced: bool,
+        sources: List[str],
+    ) -> None:
+        """
+        Write the completed trace to all backends.
 
-    def finish(self, trace: ActiveTrace) -> None:
-        """Persist a completed trace to all configured backends."""
-        import threading
-        data = trace.data
+        Args:
+            ctx: The TraceContext accumulated during the query.
+            total_latency_ms: Wall-clock time for the whole query.
+            citation_enforced: True if the system declined to answer.
+            sources: Document sources cited in the answer.
+        """
+        tokens = ctx.token_summary()
+        spans = ctx.all_spans()
 
-        # ── Local JSONL (always, synchronous — fast) ──────────────────────────
-        _write_local(self._local_path, data)
+        record = {
+            "trace_id": ctx.trace_id,
+            "question": ctx.question,
+            "timestamp_utc": ctx.timestamp_utc,
+            "total_latency_ms": round(total_latency_ms, 1),
+            "citation_enforced": citation_enforced,
+            "sources": sources,
+            "tokens": tokens,
+            "model": settings.ollama_model,
+            "prompt_version": _get_prompt_version(),
+            "spans": spans,
+        }
 
-        # ── Langfuse (async daemon thread — never blocks the pipeline) ────────
+        # ── Local JSONL (always) ───────────────────────────────────────────────
+        _write_local(self._local_path, record)
+
+        # ── Langfuse (if configured) ───────────────────────────────────────────
         if self._langfuse:
-            t = threading.Thread(
-                target=_send_to_langfuse,
-                args=(self._langfuse, data),
-                daemon=True,
+            _send_to_langfuse(self._langfuse, ctx, record)
+
+
+# ─── Local Writer ─────────────────────────────────────────────────────────────
+
+def _write_local(path: Path, record: dict) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+# ─── Langfuse Integration (Nested Spans) ──────────────────────────────────────
+
+def _send_to_langfuse(langfuse, ctx: TraceContext, record: dict) -> None:
+    """
+    Send the full span tree to Langfuse using their nested span API.
+
+    Langfuse shows these as a visual timeline:
+        trace (top-level row)
+          └── span: retrieval
+          │     └── sub-spans: bm25, vector, rrf_fusion, rerank
+          └── generation: llm-call (special node with token badge)
+    """
+    try:
+        # ── Top-level trace ────────────────────────────────────────────────────
+        trace = langfuse.trace(
+            id=ctx.trace_id,
+            name="rag-query",
+            input={"question": ctx.question},
+            output={
+                "citation_enforced": record["citation_enforced"],
+                "sources": record["sources"],
+                "total_tokens": record["tokens"].get("total_tokens", 0),
+            },
+            metadata={
+                "model": settings.ollama_model,
+                "prompt_version": record["prompt_version"],
+            },
+        )
+
+        # ── Retrieval parent span ──────────────────────────────────────────────
+        retrieval_latency = sum(
+            record["spans"].get(name, {}).get("latency_ms", 0)
+            for name in ["bm25", "vector", "rrf_fusion", "rerank"]
+        )
+        retrieval_span = trace.span(
+            name="retrieval",
+            input={"query": ctx.question},
+            output={
+                "final_chunks": record["spans"].get("rerank", {})
+                                               .get("output", {})
+                                               .get("kept_count", 0),
+                "citation_enforced": record["citation_enforced"],
+            },
+            metadata={"latency_ms": retrieval_latency},
+        )
+
+        # ── BM25 sub-span ──────────────────────────────────────────────────────
+        _maybe_child_span(retrieval_span, "bm25", record["spans"])
+
+        # ── Vector sub-span ────────────────────────────────────────────────────
+        _maybe_child_span(retrieval_span, "vector", record["spans"])
+
+        # ── RRF sub-span ───────────────────────────────────────────────────────
+        _maybe_child_span(retrieval_span, "rrf_fusion", record["spans"])
+
+        # ── Rerank sub-span ────────────────────────────────────────────────────
+        _maybe_child_span(retrieval_span, "rerank", record["spans"])
+
+        # ── Generation span (special Langfuse "generation" type) ──────────────
+        # This shows as a dedicated "LLM call" node with input/output tokens
+        gen = record["spans"].get("generation", {})
+        if gen:
+            gen_input = gen.get("input", {})
+            gen_output = gen.get("output", {})
+            trace.generation(
+                name="llm-generation",
+                model=settings.ollama_model,
+                input=gen_input.get("prompt_preview", ""),
+                output=gen_output.get("answer_preview", ""),
+                usage={
+                    "input": gen_input.get("prompt_tokens", 0),
+                    "output": gen_output.get("completion_tokens", 0),
+                    "total": gen_output.get("total_tokens", 0),
+                },
+                metadata={"latency_ms": gen.get("latency_ms", 0)},
             )
-            t.start()
+
+        langfuse.flush()
+
+    except Exception as e:
+        print(f"  ⚠ Langfuse upload failed: {e}")
+
+
+def _maybe_child_span(parent_span, name: str, spans: dict) -> None:
+    """Add a child span to parent_span if the named span was recorded."""
+    data = spans.get(name)
+    if data:
+        parent_span.span(
+            name=name,
+            input=data.get("input", {}),
+            output=data.get("output", {}),
+            metadata={"latency_ms": data.get("latency_ms", 0)},
+        )
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _now_ms() -> float:
-    """Current time in milliseconds."""
-    return time.time() * 1000
-
-
-def _now_iso() -> str:
-    """Helper for ISO-8601 timestamps."""
-    import datetime
-    return datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
-
-
-def _write_local(path: Path, data: QueryTrace) -> None:
-    """Append trace as a JSON line to the local trace file."""
-    record = asdict(data)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
-
-
 def _try_init_langfuse():
-    """
-    Create a Langfuse v2 client if:
-        1. langfuse>=2,<3 is installed
-        2. LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY are set in .env
-
-    Returns None if either condition is not met (graceful degradation).
-    """
     if not _LANGFUSE_SDK_AVAILABLE:
         return None
-
     pk = os.getenv("LANGFUSE_PUBLIC_KEY", "")
     sk = os.getenv("LANGFUSE_SECRET_KEY", "")
-
     if not pk or not sk:
         return None
-
     try:
         return Langfuse(
             public_key=pk,
@@ -240,52 +278,11 @@ def _try_init_langfuse():
         return None
 
 
-def _send_to_langfuse(langfuse, data: QueryTrace) -> None:
-    """
-    Send a completed trace to Langfuse using the v2 SDK.
-
-    Langfuse v2 trace structure:
-        trace (top-level)
-          └── span: hybrid-retrieval
-          └── span: llm-generation
-    """
+def _get_prompt_version() -> str:
+    """Read version from prompts.yaml without importing the whole generator."""
     try:
-        trace = langfuse.trace(
-            id=data.trace_id,
-            name="rag-query",
-            input={"question": data.question},
-            output={"answer_length_chars": data.answer_length_chars, "sources": data.sources},
-            metadata={
-                "model": data.model,
-                "prompt_version": data.prompt_version,
-                "citation_enforced": data.citation_enforced,
-                "total_latency_ms": data.total_latency_ms,
-            },
-        )
-
-        trace.span(
-            name="hybrid-retrieval",
-            input={"question": data.question},
-            output={
-                "bm25_candidates": data.bm25_candidates,
-                "vector_candidates": data.vector_candidates,
-                "fused_candidates": data.fused_candidates,
-                "final_chunk_count": data.final_chunk_count,
-                "top_rerank_score": data.top_rerank_score,
-                "citation_enforced": data.citation_enforced,
-            },
-            metadata={"latency_ms": data.retrieval_latency_ms},
-        )
-
-        trace.span(
-            name="llm-generation",
-            input={"chunk_count": data.final_chunk_count},
-            output={"answer_length_chars": data.answer_length_chars},
-            metadata={"latency_ms": data.generation_latency_ms},
-        )
-
-        langfuse.flush()
-
-    except Exception as e:
-        print(f"  ⚠ Langfuse upload failed: {e}")
-
+        import yaml
+        p = Path(__file__).parent.parent / "prompts" / "prompts.yaml"
+        return yaml.safe_load(p.read_text(encoding="utf-8")).get("version", "unknown")
+    except Exception:
+        return "unknown"
