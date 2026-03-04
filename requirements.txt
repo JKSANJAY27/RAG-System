@@ -28,3 +28,8 @@ pyyaml>=6.0.0
 # ─── Testing ───────────────────────────────────────────────────────────────────
 pytest>=8.0.0
 pytest-mock>=3.14.0
+
+# ─── Phase 3: Observability (optional — system works without it) ───────────────
+# Sign up free at https://cloud.langfuse.com OR self-host
+# Set LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY in .env to activate Langfuse tracing
+langfuse>=2.0.0,<3.0.0

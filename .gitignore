@@ -40,3 +40,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Phase 3: Generated at runtime (traces and eval results)
+traces/
+evals/results/

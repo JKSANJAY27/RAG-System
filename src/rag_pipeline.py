@@ -14,16 +14,14 @@ WHAT IS THIS FILE?
 
     Phase 1: Retriever used vector search only (bi-encoder similarity)
     Phase 2: HybridRetriever uses BM25 + vector + RRF + cross-encoder re-ranking
-
-    The rest of the pipeline (ingest, generate, cite) is the same.
-    The orchestrator just swaps the retrieval stage — this is the power of
-    good module design.
+    Phase 3: Added tracing (Langfuse / local JSONL) for observability
 
 TWO MAIN OPERATIONS (unchanged API):
-    1. .ingest(source, doc_type)  — Add documents (now also refreshes BM25 index)
+    1. .ingest(source, doc_type)  — Add documents (also refreshes BM25 index)
     2. .query(question)           — Hybrid search → re-rank → cite → answer
 """
 
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -34,6 +32,7 @@ from src.generator import GeneratedAnswer, Generator
 from src.hybrid_retriever import HybridRetriever
 from src.ingestor import Document, get_ingestor
 from src.reranker import CrossEncoderReranker
+from src.tracer import RAGTracer
 from src.vector_store import RetrievedChunk, VectorStore
 from config import settings
 
@@ -50,13 +49,17 @@ class RAGResponse:
     model: str
     prompt_version: str
     citation_enforced: bool                  # True if the system declined to answer
+    # Phase 3: Timing
+    retrieval_latency_ms: float = 0.0
+    generation_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
 
 
 # ─── Pipeline ─────────────────────────────────────────────────────────────────
 
 class RAGPipeline:
     """
-    The main entry point for the RAG system (Phase 2: Hybrid).
+    The main entry point for the RAG system (Phase 3: Hybrid + Tracing).
 
     Usage:
         pipeline = RAGPipeline()
@@ -64,15 +67,14 @@ class RAGPipeline:
         # Ingest documents
         pipeline.ingest("docs/paper.pdf", "pdf")
 
-        # Query with hybrid retrieval + re-ranking
+        # Query with hybrid retrieval + re-ranking + tracing
         response = pipeline.query("What is the main contribution?")
         print(response.answer)
-        if response.citation_enforced:
-            print("(System declined — no reliable evidence found)")
+        print(f"  Took {response.total_latency_ms:.0f}ms")
     """
 
     def __init__(self):
-        print("\n🚀 Initializing RAG Pipeline (Phase 2 — Hybrid)...")
+        print("\n🚀 Initializing RAG Pipeline (Phase 3 — Hybrid + Tracing)...")
         print("=" * 65)
 
         self._chunker = Chunker(
@@ -93,6 +95,7 @@ class RAGPipeline:
             reranker=self._reranker,
         )
         self._generator = Generator()
+        self._tracer = RAGTracer()   # Phase 3: observability
 
         print("=" * 65)
         print(
@@ -108,9 +111,6 @@ class RAGPipeline:
     def ingest(self, source: str, doc_type: str) -> int:
         """
         Ingest a document into the knowledge base.
-
-        Phase 2 addition: After storing chunks in ChromaDB, refreshes the
-        BM25 index so keyword search stays in sync.
 
         Args:
             source: File path or URL.
@@ -138,7 +138,7 @@ class RAGPipeline:
         # Step 4: Store in ChromaDB
         self._vector_store.add_chunks(chunks, embeddings)
 
-        # Step 5 (Phase 2 NEW): Refresh BM25 index ─────────────────────────
+        # Step 5: Refresh BM25 index
         self._bm25_store.refresh()
 
         print(f"\n✅ Done! {len(chunks)} chunks added. "
@@ -151,29 +151,64 @@ class RAGPipeline:
         """
         Answer a question using the full hybrid RAG pipeline.
 
+        Phase 3 addition: Starts a trace, records retrieval + generation
+        latency, and flushes to Langfuse / local JSONL on completion.
+
         Steps:
             1. Hybrid retrieve: BM25 + vector → RRF → cross-encoder re-rank
             2. Citation enforcement: empty result → decline answer
             3. Generate: send re-ranked chunks to Ollama → cited answer
+            4. Trace: record all telemetry and flush
 
         Args:
             question: Plain English question.
             top_k: Override for number of chunks after re-ranking.
 
         Returns:
-            RAGResponse (answer is a decline message if citation_enforced=True)
+            RAGResponse with answer, citations, and timing info.
         """
         print(f"\n❓ Question: '{question}'")
         print("-" * 55)
 
-        # Step 1: Hybrid retrieval (may return [] if citation enforcement fires)
+        # ── Phase 3: Start trace ───────────────────────────────────────────────
+        trace = self._tracer.start(question)
+
+        # ── Step 1: Hybrid retrieval ───────────────────────────────────────────
+        t_retrieval_start = time.time()
         retrieved_chunks = self._hybrid_retriever.retrieve(question, top_k=top_k)
+        retrieval_ms = (time.time() - t_retrieval_start) * 1000
 
-        # Step 2: Generate (passes [] if citation enforcement fired)
-        generated: GeneratedAnswer = self._generator.generate(question, retrieved_chunks)
-
-        # Detect if citation enforcement triggered (no chunks were kept)
         citation_enforced = len(retrieved_chunks) == 0
+
+        # Log retrieval to trace
+        top_score = retrieved_chunks[0].score if retrieved_chunks else 0.0
+        trace.log_retrieval(
+            bm25_count=self._bm25_store.doc_count,
+            vector_count=self._vector_store.count(),
+            fused_count=len(retrieved_chunks),
+            final_count=len(retrieved_chunks),
+            top_rerank_score=top_score,
+            citation_enforced=citation_enforced,
+        )
+
+        # ── Step 2: Generate ───────────────────────────────────────────────────
+        t_gen_start = time.time()
+        generated: GeneratedAnswer = self._generator.generate(question, retrieved_chunks)
+        generation_ms = (time.time() - t_gen_start) * 1000
+
+        # Log generation to trace
+        trace.log_generation(
+            answer=generated.answer,
+            sources=generated.sources,
+            prompt_version=generated.prompt_version,
+        )
+
+        # ── Flush trace ────────────────────────────────────────────────────────
+        self._tracer.finish(trace)
+
+        total_ms = retrieval_ms + generation_ms
+        print(f"\n  ⏱ Latency: retrieval={retrieval_ms:.0f}ms  "
+              f"generation={generation_ms:.0f}ms  total={total_ms:.0f}ms")
 
         return RAGResponse(
             question=question,
@@ -183,6 +218,9 @@ class RAGPipeline:
             model=generated.model,
             prompt_version=generated.prompt_version,
             citation_enforced=citation_enforced,
+            retrieval_latency_ms=round(retrieval_ms, 1),
+            generation_latency_ms=round(generation_ms, 1),
+            total_latency_ms=round(total_ms, 1),
         )
 
     @property

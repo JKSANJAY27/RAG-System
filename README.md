@@ -1,6 +1,6 @@
 # 🔍 Production RAG System
 
-A production-grade **Retrieval Augmented Generation (RAG)** system built with Python, ChromaDB, and local Ollama LLMs. Supports PDF, Markdown, and web pages. Provides **cited answers** grounded in your documents, and features an advanced **Hybrid Retrieval** pipeline with BM25, Reciprocal Rank Fusion, and Cross-Encoder Re-Ranking.
+A production-grade **Retrieval Augmented Generation (RAG)** system built with Python, ChromaDB, and local Ollama LLMs. Supports PDF, Markdown, and web pages. Provides **cited answers** grounded in your documents, features an advanced **Hybrid Retrieval** pipeline with BM25, Reciprocal Rank Fusion, and Cross-Encoder Re-Ranking, and includes **full observability** via Langfuse tracing and a golden dataset quality gate.
 
 > **Portfolio Project** — Built phase by phase to demonstrate full AI engineering lifecycle: ingestion → chunking → embedding → retrieval → generation → testing → monitoring.
 
@@ -70,24 +70,32 @@ A production-grade **Retrieval Augmented Generation (RAG)** system built with Py
 ```
 rag_system/
 ├── src/
-│   ├── ingestor.py       # PDF, Markdown, Web page loading
-│   ├── chunker.py        # Token-aware text splitting (800t / 100t overlap)
-│   ├── embedder.py       # sentence-transformers: all-MiniLM-L6-v2
-│   ├── vector_store.py   # ChromaDB wrapper (cosine similarity)
-│   ├── bm25_store.py     # 🆕 Lexical keyword search index (Phase 2)
-│   ├── retriever.py      # Basic semantic search (Phase 1)
+│   ├── ingestor.py         # PDF, Markdown, Web page loading
+│   ├── chunker.py          # Token-aware text splitting (800t / 100t overlap)
+│   ├── embedder.py         # sentence-transformers: all-MiniLM-L6-v2
+│   ├── vector_store.py     # ChromaDB wrapper (cosine similarity)
+│   ├── bm25_store.py       # 🆕 Lexical keyword search index (Phase 2)
+│   ├── retriever.py        # Basic semantic search (Phase 1)
 │   ├── hybrid_retriever.py # 🆕 BM25 + Vector + RRF fusion (Phase 2)
-│   ├── reranker.py       # 🆕 cross-encoder precision re-ranking (Phase 2)
-│   ├── generator.py      # Ollama LLM answer generation with citations
-│   └── rag_pipeline.py   # Top-level orchestrator
+│   ├── reranker.py         # 🆕 cross-encoder precision re-ranking (Phase 2)
+│   ├── tracer.py           # 🆕 Langfuse / local JSONL observability (Phase 3)
+│   ├── generator.py        # Ollama LLM answer generation with citations
+│   └── rag_pipeline.py     # Top-level orchestrator
 ├── prompts/
-│   └── prompts.yaml      # ⭐ Version-controlled prompt templates
+│   └── prompts.yaml        # ⭐ Version-controlled prompt templates
+├── evals/                    # 🆕 Phase 3: Evaluation framework
+│   ├── golden_dataset.jsonl  # 8 grounded Q&A pairs for regression testing
+│   ├── metrics.py            # Scoring: contains_check, token_f1, faithfulness
+│   └── run_evals.py          # CLI runner — scores all golden questions
+├── traces/                   # (gitignored) Per-query telemetry JSONL
 ├── tests/
-│   ├── test_chunker.py   
-│   ├── test_retriever.py 
-│   ├── test_generator.py 
-│   ├── test_hybrid_retriever.py # 🆕 RRF and BM25 tests
-│   └── test_reranker.py         # 🆕 Citation enforcement tests
+│   ├── conftest.py              # Shared fixtures + Ollama availability check
+│   ├── test_chunker.py
+│   ├── test_retriever.py
+│   ├── test_generator.py
+│   ├── test_hybrid_retriever.py # RRF and BM25 tests
+│   ├── test_reranker.py         # Citation enforcement tests
+│   └── test_evaluation.py       # 🆕 Quality gate tests
 
 ├── docs/
 │   └── transformer_architecture.md  # Sample document for testing
@@ -204,23 +212,30 @@ Model: llama3.2:3b | Prompt v1.0.0 | Time: 8.3s
 ## 🧪 Running Tests
 
 ```bash
-# Run all tests
-pytest tests/ -v
+# ─── Fast CI: no Ollama needed (~60s)
+venv\Scripts\activate
+pytest tests/ -m "not eval" -v
 
-# Run specific test files
-pytest tests/test_chunker.py -v
-pytest tests/test_retriever.py -v    # Requires embedding model (slow first run)
-pytest tests/test_generator.py -v    # Uses mocked LLM (fast, no Ollama needed)
+# ─── Full evaluation suite (requires Ollama + ingested doc)
+pytest tests/test_evaluation.py -v
+# Quality gate tests auto-skip if Ollama is not running
+
+# ─── Run the golden dataset CLI evaluation
+python evals/run_evals.py
+# Saves timestamped results to: evals/results/eval_YYYYMMDD_HHMMSS.json
 ```
 
 Expected output:
 ```
 tests/test_chunker.py::TestChunker::test_produces_multiple_chunks PASSED
 ...
+tests/test_evaluation.py::TestMetrics::test_contains_all_present PASSED
+tests/test_evaluation.py::TestMetrics::test_token_f1_perfect_match PASSED
+...
 tests/test_hybrid_retriever.py::TestRRF::test_document_in_both_lists_ranks_higher PASSED
 tests/test_reranker.py::TestCrossEncoderReranker::test_citation_enforcement_fires_when_below_threshold PASSED
 ...
-========================= 38 passed in 125.88s ==========================
+====== 53 passed, 4 deselected (eval skipped — Ollama not running) ======
 ```
 
 ---
@@ -242,6 +257,9 @@ All settings live in `.env`:
 | `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Model for precision ranking |
 | `RERANKER_TOP_K` | `3` | Final chunks sent to LLM |
 | `CITATION_SCORE_THRESHOLD` | `0.1` | Safety cutoff to prevent hallucination |
+| `LANGFUSE_PUBLIC_KEY` | *(blank)* | Langfuse public key (Phase 3) |
+| `LANGFUSE_SECRET_KEY` | *(blank)* | Langfuse secret key (Phase 3) |
+| `MIN_ANSWER_RATE` | `0.6` | Quality gate: min answer rate (Phase 3) |
 
 ---
 
@@ -274,6 +292,16 @@ Bi-encoders (like our vector embeddings) are fast but imprecise because they com
 ### What is Citation Enforcement? (Phase 2)
 If the highest-scoring chunk from the cross-encoder falls below a threshold, the system **refuses to answer**. Without this, the LLM will try to answer using weak evidence and hallucinate. Returning a polite decline is what production systems actually do.
 
+### Why a Golden Dataset? (Phase 3)
+A golden dataset is a curated set of question-answer pairs that encode your quality expectations as executable contracts. Every time you change a prompt, chunk size, or model, run `evals/run_evals.py` to check you haven't regressed. It's the difference between **hoping** your change helped and **knowing** it did.
+
+### What is LLM Observability? (Phase 3)
+Every query your system handles generates rich telemetry: retrieval latency, re-ranker scores, number of chunks retrieved, citation enforcement rate. Without capturing this, you're operating blind. Langfuse (or the local JSONL fallback) makes every query inspectable, enabling you to catch regressions, optimize slow queries, and track quality over time.
+
+### Two Types of Tests in Production AI
+- **Unit/integration tests** (`pytest tests/ -m "not eval"`) — verify code correctness, run in CI in seconds, no GPU needed
+- **Evaluation tests** (`pytest tests/ -m eval`) — verify *answer quality*, require Ollama, run before releases
+
 ---
 
 ## 🗺️ Roadmap
@@ -282,7 +310,7 @@ If the highest-scoring chunk from the cross-encoder falls below a threshold, the
 |-------|--------|---------|
 | Phase 1 | ✅ **Complete** | Core RAG pipeline, PDF/MD/Web ingestion, citations, tests |
 | Phase 2 | ✅ **Complete** | Hybrid BM25 + vector search, RRF fusion, cross-encoder re-ranking, citation enforcement |
-| Phase 3 | 🔜 Upcoming | Langfuse tracing, golden eval dataset, CI regression gating, cost tracking |
+| Phase 3 | ✅ **Complete** | Langfuse tracing, golden eval dataset, quality gate tests, per-query latency tracking |
 
 ---
 
@@ -295,6 +323,7 @@ If the highest-scoring chunk from the cross-encoder falls below a threshold, the
 | Embeddings | sentence-transformers | Fast, local, no API needed |
 | Lexical Search | rank-bm25 | Standard keyword matching |
 | Re-Ranker | cross-encoder/ms-marco | Precision relevance scoring |
+| Observability | Langfuse | LLM-native tracing dashboard |
 | LLM | Ollama (llama3.2:3b) | Runs locally, no cost |
 | Token counting | tiktoken | Accurate (matches real model tokenizer) |
 | Config | python-dotenv + YAML | Clean separation of code and config |

@@ -18,6 +18,11 @@ import argparse
 import sys
 from pathlib import Path
 
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
+
 from src.rag_pipeline import RAGPipeline
 
 
