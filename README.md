@@ -313,6 +313,12 @@ Instead of just logging the total time a query took (Phase 3), span-based tracin
 - **Unit/integration tests** (`pytest tests/ -m "not eval"`) — verify code correctness, run in CI in seconds, no GPU needed
 - **Evaluation tests** (`pytest tests/ -m eval`) — verify *answer quality*, require Ollama, run before releases
 
+### Why P50/P95 Instead of Average? (Phase 5)
+Averages hide your worst-case performance. 9 queries at 2s + 1 query at 20s = average 3.8s, but P95 = 20s. P50 (median) is what a *typical* user experiences. P95 is what your slowest 1-in-20 users experience. That's the number you optimize and put in your SLA.
+
+### What is Citation Coverage? (Phase 5)
+The percentage of answered queries that included at least one source citation. A high citation rate means the system is retrieving relevant documents and grounding its answers. A low rate means the retrieval is weak — time to review your chunking strategy or ingested documents.
+
 ---
 
 ## 🗺️ Roadmap
@@ -323,6 +329,8 @@ Instead of just logging the total time a query took (Phase 3), span-based tracin
 | Phase 2 | ✅ **Complete** | Hybrid BM25 + vector search, RRF fusion, cross-encoder re-ranking, citation enforcement |
 | Phase 3 | ✅ **Complete** | Langfuse integration, golden eval dataset, quality gate tests |
 | Phase 4 | ✅ **Complete** | Full span-based tracing (`TraceContext`, `SpanTimer`), detailed nested Langfuse timelines, token counting |
+| Phase 5 | ✅ **Complete** | P50/P95/P99 latency metrics, per-stage breakdown, citation coverage, SRE alerts, HTML report |
+| Phase 6 | 🔜 Upcoming | GitHub Actions CI, auto-failing quality gates, prompt versioning in pipeline |
 
 ---
 
