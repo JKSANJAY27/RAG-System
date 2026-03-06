@@ -80,20 +80,23 @@ rag_system/
 │   ├── chunker.py          # Token-aware text splitting (800t / 100t overlap)
 │   ├── embedder.py         # sentence-transformers: all-MiniLM-L6-v2
 │   ├── vector_store.py     # ChromaDB wrapper (cosine similarity)
-│   ├── bm25_store.py       # Lexical keyword search index (Phase 2)
+│   ├── bm25_store.py       # Lexical keyword search (Phase 2)
 │   ├── retriever.py        # Basic semantic search (Phase 1)
-│   ├── hybrid_retriever.py # BM25 + Vector + RRF fusion (Phase 2, instrumented P4)
-│   ├── reranker.py         # Cross-encoder precision re-ranking (Phase 2)
-│   ├── trace_context.py    # 🆕 Span collector passed through call chain (Phase 4)
-│   ├── tracer.py           # Langfuse / local JSONL observability (Phase 3+4)
+│   ├── hybrid_retriever.py # BM25 + Vector + RRF fusion + spans (Phase 2 & 4)
+│   ├── reranker.py         # Cross-encoder re-ranking (Phase 2)
+│   ├── trace_context.py    # Span collector threaded through call chain (Phase 4)
+│   ├── tracer.py           # Langfuse / local JSONL backend (Phase 3 & 4)
 │   ├── generator.py        # Ollama LLM + tiktoken token counting (Phase 4)
 │   └── rag_pipeline.py     # Top-level orchestrator
 ├── prompts/
-│   └── prompts.yaml        # ⭐ Version-controlled prompt templates
-├── evals/                    # Phase 3: Evaluation framework
-│   ├── golden_dataset.jsonl  # 8 grounded Q&A pairs for regression testing
-│   ├── metrics.py            # Scoring: contains_check, token_f1, faithfulness
-│   └── run_evals.py          # CLI runner — scores all golden questions
+│   └── prompts.yaml        # ⭐ Version-controlled prompt templates (CI-verified)
+├── evals/
+│   ├── golden_dataset.jsonl  # 8 grounded Q&A pairs
+│   ├── metrics.py            # contains_check, token_f1, faithfulness
+│   ├── results/              # (gitignored) Per-run eval JSON
+│   └── run_evals.py          # CLI: python evals/run_evals.py [--ci]
+├── .github/workflows/
+│   └── ci.yml                # 🆕 GitHub Actions: fast tests + quality gate (Phase 6)
 ├── traces/                   # (gitignored) Per-query span tree JSONL
 ├── tests/
 │   ├── conftest.py
@@ -103,16 +106,18 @@ rag_system/
 │   ├── test_hybrid_retriever.py
 │   ├── test_reranker.py
 │   ├── test_evaluation.py    # Quality gate tests
-│   └── test_tracer.py        # 🆕 SpanTimer + TraceContext + JSONL writer (Phase 4)
-
+│   ├── test_tracer.py        # SpanTimer + TraceContext + JSONL (Phase 4)
+│   └── test_metrics_dashboard.py  # Percentile math + metric aggregation (Phase 5)
 ├── docs/
-│   └── transformer_architecture.md  # Sample document for testing
-├── config.py             # Centralized settings from .env
-├── ingest.py             # CLI: add a document to knowledge base
-├── ask.py                # CLI: one-shot question answering
-├── main.py               # Interactive REPL (multi-turn Q&A)
+│   └── transformer_architecture.md
+├── config.py             # Centralized settings with Phase 6 quality gate thresholds
+├── metrics_dashboard.py  # 🆕 CLI: P50/P95 latency, citation rate, SRE alerts (Phase 5)
+├── pytest.ini            # 🆕 Marker config, warning filters (Phase 6)
+├── ingest.py
+├── ask.py
+├── main.py
 ├── requirements.txt
-├── .env.example          # Template — copy to .env and configure
+├── .env.example          # Complete config template (schema-checked in CI)
 └── README.md
 ```
 
@@ -309,11 +314,24 @@ Every query your system handles generates rich telemetry: retrieval latency, re-
 ### What is Span-Based Tracing? (Phase 4)
 Instead of just logging the total time a query took (Phase 3), span-based tracing creates a nested tree of every sub-operation. When a query is slow, you don't just know it was slow—you can see exactly that `bm25` took 12ms, `vector` took 38ms, `rerank` took 340ms, and `generation` took 6.9s. We pass a `TraceContext` down the entire call chain to build this "glass box", which is crucial for optimizing operations and token usage in production.
 
-### Two Types of Tests in Production AI
-- **Unit/integration tests** (`pytest tests/ -m "not eval"`) — verify code correctness, run in CI in seconds, no GPU needed
-- **Evaluation tests** (`pytest tests/ -m eval`) — verify *answer quality*, require Ollama, run before releases
+### What is CI Regression Gating? (Phase 6)
+A **regression** is when a change makes the system worse without anyone noticing. CI gating prevents this automatically:
+1. You change the prompt in `prompts.yaml` (or the chunk size, or the model)
+2. Push to GitHub → workflow triggers
+3. Fast tests run (code still correct ✓)
+4. On PR to `main`: `python evals/run_evals.py --ci` runs all 8 golden questions
+5. If `mean_faithfulness` drops from 0.72 → 0.35, the gate catches it → PR blocked with clear message
+6. You fix the change → gate passes → merge
 
-### Why P50/P95 Instead of Average? (Phase 5)
+This loop makes quality a **measurable, enforceable contract**, not a hope.
+
+### Why Version Prompts Like Code? (Phase 6)
+A prompt is a configuration file that directly controls system behavior. `prompts.yaml` has a `version` field (e.g. `1.2.0`). CI fails if someone edits the template without bumping the version. This gives you:
+- `git blame` for every quality change
+- A paper trail: "quality dropped after a prompt change on Jan 15"
+- The ability to rollback a bad prompt change the same way you rollback code
+
+---
 Averages hide your worst-case performance. 9 queries at 2s + 1 query at 20s = average 3.8s, but P95 = 20s. P50 (median) is what a *typical* user experiences. P95 is what your slowest 1-in-20 users experience. That's the number you optimize and put in your SLA.
 
 ### What is Citation Coverage? (Phase 5)
@@ -330,7 +348,7 @@ The percentage of answered queries that included at least one source citation. A
 | Phase 3 | ✅ **Complete** | Langfuse integration, golden eval dataset, quality gate tests |
 | Phase 4 | ✅ **Complete** | Full span-based tracing (`TraceContext`, `SpanTimer`), detailed nested Langfuse timelines, token counting |
 | Phase 5 | ✅ **Complete** | P50/P95/P99 latency metrics, per-stage breakdown, citation coverage, SRE alerts, HTML report |
-| Phase 6 | 🔜 Upcoming | GitHub Actions CI, auto-failing quality gates, prompt versioning in pipeline |
+| Phase 6 | ✅ **Complete** | GitHub Actions CI, prompt versioning guard, `.env.example` schema check, `--ci` regression gate |
 
 ---
 

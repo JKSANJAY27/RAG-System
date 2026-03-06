@@ -1,0 +1,179 @@
+# .github/workflows/ci.yml — Continuous Integration (Phase 6)
+#
+# WHAT THIS DOES:
+#   Every time you push any branch or open a PR, GitHub runs this file
+#   automatically. Think of it as a robot that checks your work before
+#   it enters the main branch.
+#
+# TWO JOBS:
+#   1. fast-tests  — runs on every push, no Ollama needed (~2mins in CI)
+#      Coverage: chunking, BM25/RRF logic, reranker, metric math, tracer JSONL,
+#                evaluation metric functions, metrics dashboard aggregation
+#      Result: 98 unit/integration tests must all pass
+#
+#   2. quality-gate — runs ONLY on PRs to main, requires a self-hosted runner
+#      with Ollama installed (your own machine acting as a CI runner).
+#      Coverage: all 8 golden eval questions scored against quality thresholds.
+#      Result: exit 0 (pass) or exit 1 (fail, PR blocked)
+#
+# HOW GITHUB ACTIONS WORKS (for beginners):
+#   - GitHub spins up a fresh Ubuntu VM for each job
+#   - "steps" run sequentially inside that VM
+#   - If any step exits non-zero → job fails → PR shows a red ✗
+#   - "self-hosted" runner = your own PC registered as a CI runner
+#     (see: https://docs.github.com/en/actions/hosting-your-own-runners)
+#
+# PROMPT VERSIONING CHECK:
+#   We verify prompts/prompts.yaml has a "version" field on every push.
+#   If someone changes the prompt template without bumping the version,
+#   the CI fails with a clear message. This enforces the discipline that
+#   prompt changes are treated like code changes.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]       # ALL branches — catch problems early
+  pull_request:
+    branches: [main, master]
+
+env:
+  PYTHON_VERSION: "3.12"
+
+# ─── Job 1: FAST TESTS (no Ollama, runs on GitHub-hosted runners) ─────────────
+jobs:
+  fast-tests:
+    name: "Fast Tests (unit + integration, no Ollama)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"           # Cache pip packages between runs for speed
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Write a minimal .env so config.py can load without errors.
+      # We don't need real Ollama/Langfuse keys for these tests.
+      - name: Create minimal .env for CI
+        run: |
+          cat > .env << 'EOF'
+          OLLAMA_BASE_URL=http://localhost:11434
+          OLLAMA_MODEL=llama3.2:3b
+          CHROMA_PERSIST_DIR=./chroma_db
+          CHROMA_COLLECTION_NAME=rag_documents
+          TOP_K=5
+          CHUNK_SIZE=800
+          CHUNK_OVERLAP=100
+          HYBRID_ALPHA=0.5
+          RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+          RERANKER_TOP_K=3
+          CITATION_SCORE_THRESHOLD=0.1
+          MIN_ANSWER_RATE=0.6
+          MIN_MEAN_CONTAINS=0.5
+          MIN_CITATION_RATE=0.7
+          MIN_MEAN_FAITHFULNESS=0.4
+          EOF
+
+      # The heart of fast CI: run every test EXCEPT @pytest.mark.eval
+      - name: Run fast test suite
+        run: pytest tests/ -m "not eval" -v
+
+      # Prompt versioning guard: fail the build if someone edits prompts.yaml
+      # without bumping the version field.
+      # This is the "executable contract" for prompt discipline.
+      - name: Verify prompt versioning
+        run: |
+          python - << 'EOF'
+          import yaml, sys
+          with open("prompts/prompts.yaml", "r", encoding="utf-8") as f:
+              data = yaml.safe_load(f)
+          version = data.get("version")
+          if not version:
+              print("❌ prompts/prompts.yaml is missing a 'version' field!")
+              print("   Every change to a prompt template MUST bump the version.")
+              print("   Example: version: '1.2.0'")
+              sys.exit(1)
+          print(f"✅ Prompt version: {version}")
+          EOF
+
+      # Config schema guard: verify that every key in config.py has a
+      # corresponding entry in .env.example (the schema documentation).
+      - name: Verify .env.example documents all config keys
+        run: |
+          python - << 'EOF'
+          import re, sys
+          # Read all os.getenv() calls from config.py
+          with open("config.py") as f:
+              config_src = f.read()
+          config_keys = set(re.findall(r'os\.getenv\("([^"]+)"', config_src))
+
+          # Read all KEY= lines from .env.example
+          with open(".env.example") as f:
+              example_src = f.read()
+          example_keys = set(re.findall(r'^([A-Z_]+)=', example_src, re.MULTILINE))
+
+          missing = config_keys - example_keys
+          if missing:
+              print(f"❌ These config keys are used in config.py but not in .env.example:")
+              for k in sorted(missing):
+                  print(f"   {k}")
+              print("   Add them to .env.example so other developers know to set them.")
+              sys.exit(1)
+          print(f"✅ All {len(config_keys)} config keys documented in .env.example")
+          EOF
+
+# ─── Job 2: QUALITY GATE (needs Ollama, self-hosted runner only) ──────────────
+  quality-gate:
+    name: "Quality Gate (golden eval, self-hosted with Ollama)"
+    runs-on: self-hosted      # Your own machine registered as a GitHub Actions runner
+    if: github.event_name == 'pull_request'
+    needs: fast-tests          # Only run if fast tests pass
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # On your self-hosted runner, .env has real keys including Langfuse.
+      # We copy .env.example as fallback if .env doesn't exist yet.
+      - name: Ensure .env exists
+        run: |
+          if [ ! -f .env ]; then
+            cp .env.example .env
+            echo "⚠ .env not found, using .env.example defaults"
+          fi
+
+      # Ingest the sample document that the golden eval questions are based on.
+      # --skip-existing ensures we don't re-embed if already ingested.
+      - name: Ingest sample document
+        run: python ingest.py --source docs/transformer_architecture.md --type markdown
+
+      # Run all 8 golden eval questions. Exits 1 if any metric is below threshold.
+      # The thresholds come from MIN_* variables in .env (config.py reads them).
+      - name: Run quality gate evaluation
+        run: python evals/run_evals.py --ci
+
+      # Always upload the eval results JSON as a CI artifact, even on failure.
+      # This lets you download the results and see which questions failed.
+      - name: Upload eval results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results-${{ github.run_number }}
+          path: evals/results/
+          retention-days: 30

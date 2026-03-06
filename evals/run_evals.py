@@ -245,5 +245,59 @@ if __name__ == "__main__":
         default=None,
         help="Path to save results JSON (default: evals/results/eval_<timestamp>.json)",
     )
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help=(
+            "CI mode: check metrics against quality gate thresholds from .env "
+            "and exit with code 1 if any threshold is not met. "
+            "This is what GitHub Actions calls on every PR to main."
+        ),
+    )
     args = parser.parse_args()
-    run_evaluation(args.dataset, args.output)
+
+    full_results = run_evaluation(args.dataset, args.output)
+
+    # ── CI Quality Gate ────────────────────────────────────────────────────────
+    if args.ci:
+        from config import settings
+
+        agg = full_results["aggregate"]
+
+        # Map each metric to its config threshold
+        gates = [
+            ("answer_rate",       agg["answer_rate"],        settings.min_answer_rate,       "MIN_ANSWER_RATE"),
+            ("mean_contains",     agg["mean_contains_score"], settings.min_mean_contains,     "MIN_MEAN_CONTAINS"),
+            ("citation_rate",     agg["citation_rate"],       settings.min_citation_rate,     "MIN_CITATION_RATE"),
+            ("mean_faithfulness", agg["mean_faithfulness"],   settings.min_mean_faithfulness, "MIN_MEAN_FAITHFULNESS"),
+        ]
+
+        failures = []
+        passes   = []
+
+        for metric, actual, threshold, env_var in gates:
+            if actual < threshold:
+                failures.append(
+                    f"  ✗ {metric:<22}: {actual:.3f} < {threshold:.3f}  "
+                    f"(set {env_var} in .env to adjust)"
+                )
+            else:
+                passes.append(f"  ✓ {metric:<22}: {actual:.3f} ≥ {threshold:.3f}")
+
+        print("\n" + "═" * 65)
+        print("  🚦 CI QUALITY GATE RESULTS")
+        print("═" * 65)
+        for p in passes:
+            print(p)
+        for f in failures:
+            print(f)
+
+        if failures:
+            print("\n  ❌ QUALITY GATE FAILED — " + str(len(failures)) + " threshold(s) not met")
+            print("     Fix the regression before merging this change.")
+            print("═" * 65)
+            sys.exit(1)
+        else:
+            print("\n  ✅ QUALITY GATE PASSED — all metrics above thresholds")
+            print("═" * 65)
+            sys.exit(0)

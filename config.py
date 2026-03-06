@@ -3,6 +3,11 @@ config.py — Central configuration for the RAG system.
 
 All settings are loaded from the .env file (or environment variables).
 Every module imports from here, so there's one single source of truth.
+
+PHASE HISTORY:
+    Phase 1: ollama, chroma, retrieval, chunking
+    Phase 2: hybrid_alpha, reranker_model, reranker_top_k, citation_score_threshold
+    Phase 6: quality gate thresholds used by CI regression gating
 """
 
 import os
@@ -39,6 +44,16 @@ class Settings:
     reranker_top_k: int            # keep only this many chunks after re-ranking
     citation_score_threshold: float  # min sigmoid score; below = decline to answer
 
+    # ── Phase 6: CI Quality Gate Thresholds ──────────────────────────────────
+    # These define the MINIMUM acceptable quality for the system to pass CI.
+    # The quality gate (python evals/run_evals.py --ci) checks these after
+    # every change to the prompt, retrieval config, or document corpus.
+    # Fail = build blocked. Pass = safe to merge.
+    min_answer_rate: float         # min fraction of questions that get answered
+    min_mean_contains: float       # min avg keyword match score across answers
+    min_citation_rate: float       # min fraction of answers citing a source
+    min_mean_faithfulness: float   # min avg faithfulness (grounding) score
+
 
 def load_settings() -> Settings:
     """Read environment variables and return a validated Settings object."""
@@ -55,6 +70,11 @@ def load_settings() -> Settings:
         reranker_model=os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
         reranker_top_k=int(os.getenv("RERANKER_TOP_K", "3")),
         citation_score_threshold=float(os.getenv("CITATION_SCORE_THRESHOLD", "0.1")),
+        # Phase 6: quality gate thresholds (match the values in .env)
+        min_answer_rate=float(os.getenv("MIN_ANSWER_RATE", "0.6")),
+        min_mean_contains=float(os.getenv("MIN_MEAN_CONTAINS", "0.5")),
+        min_citation_rate=float(os.getenv("MIN_CITATION_RATE", "0.7")),
+        min_mean_faithfulness=float(os.getenv("MIN_MEAN_FAITHFULNESS", "0.4")),
     )
 
 
