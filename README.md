@@ -251,6 +251,58 @@ tests/test_reranker.py::TestCrossEncoderReranker::... PASSED
 ====== 73 passed, 4 deselected (eval tests auto-skip without Ollama) ======
 ```
 
+1. Ingesting Documents (Knowledge Base Building)
+These commands process documents (chunking, embedding, vector DB storage, and BM25 index building).
+
+# Ingest local markdown or text files
+python ingest.py --source docs/transformer_architecture.md --type markdown
+# Ingest local PDF files
+python ingest.py --source path/to/your/document.pdf --type pdf
+# Ingest web pages directly via URL
+python ingest.py --source https://en.wikipedia.org/wiki/Transformer_(deep_learning) --type web
+2. Single-Shot Querying (ask.py)
+Best for quick tests. This triggers the full Phase 2 & 4 pipeline: BM25 + Vector → Reciprocal Rank Fusion → Cross-Encoder Re-Ranking → Citation Enforcement → LLM Generation → Langfuse Tracing.
+
+# Ask a standard question (will cite sources)
+python ask.py --question "What is the self-attention mechanism?"
+# Ask a question and force the system to print the raw chunks it retrieved and re-ranked
+python ask.py --question "How do Transformers beat RNNs?" --show-chunks
+# Force citation enforcement (ask something NOT in the document to see it decline gracefully)
+python ask.py --question "What is the capital of France?"
+3. Interactive REPL (main.py)
+Best for an engaging user experience. This drops you into a chat-like terminal interface where you can ask multiple questions in a row without reloading the models each time.
+
+# Start the interactive query loop
+python main.py
+4. Running the Evaluation Suite (Quality Assurance)
+This runs the system against the 8 "Golden Questions" curated in evals/golden_dataset.jsonl
+ to ensure answer quality hasn't regressed. It calculates Metrics like Contains, Token F1, and Faithfulness.
+
+# Run the full evaluation and generate a detailed summary report
+python evals/run_evals.py
+# Run in CI mode (less verbose output, pure JSON logs)
+python evals/run_evals.py --ci
+5. Running the Unit Tests (pytest)
+The project is hardened with a robust test suite covering chunkers, retrievers, metrics, and tracers.
+
+# Run all fast unit/integration tests (skips the slow LLM generation tests)
+pytest tests/ -m "not eval" -v
+# Run the FULL test suite, including the LLM automated Quality Gates
+pytest tests/ -v
+6. Viewing Traces & Observability
+After running any of the ask.py, main.py, or run_evals.py commands, your telemetry is captured:
+
+Option A: Cloud Dashboard (The "Glass Box")
+
+Go to https://cloud.langfuse.com
+Log in and go to your Project → Traces
+Click any row to see the beautiful nested span tree showing exactly how many milliseconds bm25, vector, and rerank took, plus exact token counts.
+
+Option B: Local Fallback If you aren't using the cloud dashboard, all the nested trace data is perfectly persisted locally:
+
+# View the raw JSONL traces (contains the full span tree for every query)
+cat traces/traces.jsonl
+
 ---
 
 ## ⚙️ Configuration Reference
