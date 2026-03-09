@@ -73,24 +73,24 @@ A production-grade **Retrieval Augmented Generation (RAG)** system built with Py
 
 ## 🗂️ Project Structure
 
-```
+```text
 rag_system/
 ├── src/
-│   ├── ingestor.py          # PDF, Markdown, Web page loading
-│   ├── chunker.py           # Token-aware text splitting (800 / 100 overlap)
-│   ├── embedder.py          # sentence-transformers: all-MiniLM-L6-v2
-│   ├── vector_store.py      # ChromaDB wrapper
-│   ├── bm25_store.py        # Lexical keyword search
-│   ├── retriever.py         # Basic semantic search
-│   ├── hybrid_retriever.py  # BM25 + Vector + RRF fusion
-│   ├── reranker.py          # Cross-encoder re-ranking
-│   ├── trace_context.py     # Span collector
-│   ├── tracer.py            # Langfuse / JSONL tracing
-│   ├── generator.py         # Ollama LLM interface
-│   └── rag_pipeline.py      # Top-level orchestrator
+│   ├── ingestor.py
+│   ├── chunker.py
+│   ├── embedder.py
+│   ├── vector_store.py
+│   ├── bm25_store.py
+│   ├── retriever.py
+│   ├── hybrid_retriever.py
+│   ├── reranker.py
+│   ├── trace_context.py
+│   ├── tracer.py
+│   ├── generator.py
+│   └── rag_pipeline.py
 │
 ├── prompts/
-│   └── prompts.yaml         # Version-controlled prompt templates
+│   └── prompts.yaml
 │
 ├── evals/
 │   ├── golden_dataset.jsonl
@@ -99,14 +99,10 @@ rag_system/
 │   └── run_evals.py
 │
 ├── tests/
-│   ├── conftest.py
 │   ├── test_chunker.py
 │   ├── test_retriever.py
 │   ├── test_generator.py
-│   ├── test_hybrid_retriever.py
-│   ├── test_reranker.py
-│   ├── test_evaluation.py
-│   └── test_tracer.py
+│   └── test_reranker.py
 │
 ├── docs/
 │   └── transformer_architecture.md
@@ -120,7 +116,6 @@ rag_system/
 ├── .env.example
 └── README.md
 ```
-
 ---
 
 ## ⚡ Quick Start
