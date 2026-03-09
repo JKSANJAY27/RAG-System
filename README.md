@@ -76,28 +76,28 @@ A production-grade **Retrieval Augmented Generation (RAG)** system built with Py
 ```
 rag_system/
 ├── src/
-│   ├── ingestor.py         # PDF, Markdown, Web page loading
-│   ├── chunker.py          # Token-aware text splitting (800t / 100t overlap)
-│   ├── embedder.py         # sentence-transformers: all-MiniLM-L6-v2
-│   ├── vector_store.py     # ChromaDB wrapper (cosine similarity)
-│   ├── bm25_store.py       # Lexical keyword search (Phase 2)
-│   ├── retriever.py        # Basic semantic search (Phase 1)
-│   ├── hybrid_retriever.py # BM25 + Vector + RRF fusion + spans (Phase 2 & 4)
-│   ├── reranker.py         # Cross-encoder re-ranking (Phase 2)
-│   ├── trace_context.py    # Span collector threaded through call chain (Phase 4)
-│   ├── tracer.py           # Langfuse / local JSONL backend (Phase 3 & 4)
-│   ├── generator.py        # Ollama LLM + tiktoken token counting (Phase 4)
-│   └── rag_pipeline.py     # Top-level orchestrator
+│   ├── ingestor.py          # PDF, Markdown, Web page loading
+│   ├── chunker.py           # Token-aware text splitting (800 / 100 overlap)
+│   ├── embedder.py          # sentence-transformers: all-MiniLM-L6-v2
+│   ├── vector_store.py      # ChromaDB wrapper
+│   ├── bm25_store.py        # Lexical keyword search
+│   ├── retriever.py         # Basic semantic search
+│   ├── hybrid_retriever.py  # BM25 + Vector + RRF fusion
+│   ├── reranker.py          # Cross-encoder re-ranking
+│   ├── trace_context.py     # Span collector
+│   ├── tracer.py            # Langfuse / JSONL tracing
+│   ├── generator.py         # Ollama LLM interface
+│   └── rag_pipeline.py      # Top-level orchestrator
+│
 ├── prompts/
-│   └── prompts.yaml        # ⭐ Version-controlled prompt templates (CI-verified)
+│   └── prompts.yaml         # Version-controlled prompt templates
+│
 ├── evals/
-│   ├── golden_dataset.jsonl  # 8 grounded Q&A pairs
-│   ├── metrics.py            # contains_check, token_f1, faithfulness
-│   ├── results/              # (gitignored) Per-run eval JSON
-│   └── run_evals.py          # CLI: python evals/run_evals.py [--ci]
-├── .github/workflows/
-│   └── ci.yml                # 🆕 GitHub Actions: fast tests + quality gate (Phase 6)
-├── traces/                   # (gitignored) Per-query span tree JSONL
+│   ├── golden_dataset.jsonl
+│   ├── metrics.py
+│   ├── results/
+│   └── run_evals.py
+│
 ├── tests/
 │   ├── conftest.py
 │   ├── test_chunker.py
@@ -105,19 +105,19 @@ rag_system/
 │   ├── test_generator.py
 │   ├── test_hybrid_retriever.py
 │   ├── test_reranker.py
-│   ├── test_evaluation.py    # Quality gate tests
-│   ├── test_tracer.py        # SpanTimer + TraceContext + JSONL (Phase 4)
-│   └── test_metrics_dashboard.py  # Percentile math + metric aggregation (Phase 5)
+│   ├── test_evaluation.py
+│   └── test_tracer.py
+│
 ├── docs/
 │   └── transformer_architecture.md
-├── config.py             # Centralized settings with Phase 6 quality gate thresholds
-├── metrics_dashboard.py  # 🆕 CLI: P50/P95 latency, citation rate, SRE alerts (Phase 5)
-├── pytest.ini            # 🆕 Marker config, warning filters (Phase 6)
+│
 ├── ingest.py
 ├── ask.py
 ├── main.py
+├── config.py
+├── metrics_dashboard.py
 ├── requirements.txt
-├── .env.example          # Complete config template (schema-checked in CI)
+├── .env.example
 └── README.md
 ```
 
