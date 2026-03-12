@@ -59,6 +59,9 @@ class RAGResponse:
     completion_tokens: int = 0
     total_tokens: int = 0
     trace_id: str = ""
+    # Exposed trace context for UI
+    trace_ctx: Optional[TraceContext] = None
+
 
 
 # ─── Pipeline ─────────────────────────────────────────────────────────────────
@@ -204,6 +207,7 @@ class RAGPipeline:
             completion_tokens=generated.completion_tokens,
             total_tokens=generated.total_tokens,
             trace_id=ctx.trace_id,
+            trace_ctx=ctx,
         )
 
     @property
